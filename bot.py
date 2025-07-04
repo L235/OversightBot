@@ -1,14 +1,22 @@
 """
 Discord Oversight Request Bot
 
-This bot facilitates the secure submission and handling of English Wikipedia Oversight requests within a Discord server. It ensures that only authorized Oversighters can view and claim requests, and provides a private, auditable workflow for sensitive information. Key features include:
+This bot facilitates the secure submission and handling of English Wikipedia 
+Oversight requests within a Discord server. It ensures that only authorized 
+Oversighters can view and claim requests, and provides a private, auditable 
+workflow for sensitive information.
 
-- Submission of oversight requests via a slash command, with optional role-based gating for submitters.
-- Storage of requests in a persistent SQLite database, with unique numeric ticket IDs.
-- Per-user rate limiting to prevent spam or abuse.
-- Oversighters can claim requests, view details, and notify the original submitter when their request is accessed.
-- Opt-in ping system for Oversighters to receive mentions on new requests, managed via a simple command in the restricted channel.
-- All configuration (tokens, IDs, etc.) is provided via environment variables for security and flexibility.
+Key features:
+- Submission of oversight requests via slash command with optional role-based gating
+- Persistent SQLite database storage with unique numeric ticket IDs
+- Per-user rate limiting to prevent spam or abuse
+- Oversighters can claim requests, view details, and notify original submitters
+- Opt-in ping system for Oversighters to receive mentions on new requests, managed via a 
+  simple command in the restricted channel.
+- `!OversightBot help` message command listing all available commands.
+- Sensitive request content is now delivered via **ephemeral** slash‑command replies 
+  instead of user DMs for stronger in‑server privacy.
+- All configuration provided via environment variables for security
 
 Dependencies: discord.py >= 2.4, aiosqlite
 """
@@ -53,7 +61,7 @@ logging.basicConfig(
 logger = logging.getLogger("oversight-bot")
 
 # External ticket IDs start at 101 for user-facing clarity
-ID_OFFSET = 100
+ID_OFFSET = 0
 
 # ===================== Utility and Permission Helpers =====================
 
@@ -83,7 +91,8 @@ async def notify_restricted(
     content: str,
     ping_new: bool = False,
 ) -> None:
-    """Send a message to the restricted channel, optionally pinging opted-in Oversighters."""
+    """Send a message to the restricted channel, optionally pinging opted-in 
+    Oversighters."""
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
     if not chan:
         return
@@ -293,18 +302,13 @@ async def claim(interaction: discord.Interaction, request_id: int):
         )
         return
 
-    # Send the request details to the Oversighter via DM
-    try:
-        await interaction.user.send(
-            f"📄 **Oversight Request {request_id}**\n\n"
-            f"{req['text']}\n\n"
-            f"_Submitted by <@{req['author_id']}>_"
-        )
-    except discord.HTTPException:
-        await interaction.followup.send(
-            "❌ Couldn't send you a DM. Check your privacy settings.", ephemeral=True
-        )
-        return
+    # Send the request details to the Oversighter inline (ephemeral)
+    await interaction.followup.send(
+        f"📄 **Oversight Request {request_id}**\n\n"
+        f"{req['text']}\n\n"
+        f"_Submitted by <@{req['author_id']}>_",
+        ephemeral=True,
+    )
 
     # Notify the original author that their request was claimed (first claim only)
     if req["author_id"]:
@@ -322,7 +326,6 @@ async def claim(interaction: discord.Interaction, request_id: int):
         bot,
         f"✅ Request `{request_id}` claimed by {interaction.user.mention}."
     )
-    await interaction.followup.send("📬 I've sent the request to your DMs.", ephemeral=True)
     logger.info("Request %s claimed by %s", request_id, interaction.user)
 
 @bot.tree.command(
@@ -346,18 +349,13 @@ async def view(interaction: discord.Interaction, request_id: int):
         return
     unclaimed = req["claimed_by"] is None
 
-    # Send the request details to the Oversighter via DM
-    try:
-        await interaction.user.send(
-            f"📄 **Oversight Request {request_id}**\n\n"
-            f"{req['text']}\n\n"
-            f"_Submitted by <@{req['author_id']}>_"
-        )
-    except discord.HTTPException:
-        await interaction.followup.send(
-            "❌ Couldn't DM you. Check your privacy settings.", ephemeral=True
-        )
-        return
+    # Send the request details to the Oversighter inline (ephemeral)
+    await interaction.followup.send(
+        f"📄 **Oversight Request {request_id}**\n\n"
+        f"{req['text']}\n\n"
+        f"_Submitted by <@{req['author_id']}>_",
+        ephemeral=True,
+    )
 
     # Announce the view in the restricted channel, indicating claim status
     status = "unclaimed" if unclaimed else "claimed"
@@ -365,7 +363,6 @@ async def view(interaction: discord.Interaction, request_id: int):
         bot,
         f"👓 {interaction.user.mention} viewed {status} request `{request_id}`."
     )
-    await interaction.followup.send("✅ Check your DMs – request delivered.", ephemeral=True)
     logger.info("Request %s viewed by %s (status: %s)", request_id, interaction.user, status)
 
 @bot.tree.command(
@@ -391,6 +388,24 @@ async def on_message(message: discord.Message):
         return
 
     text = message.content.strip()
+
+    # ----------------------------- HELP COMMAND -----------------------------
+    if text.lower().startswith("!oversightbot help"):
+        help_text = (
+            f"**OversightBot Command Reference**\n"
+            f"• `/oversight <text>` – Submit an Oversight request (max 2 every "
+            f"{COOLDOWN_SECONDS}s)\n"
+            "• `/claim <ID>` – Claim & view an unclaimed request (Oversighters only)\n"
+            "• `/view <ID>` – View any request by ID (Oversighters only)\n"
+            "• `/pending` – List unclaimed request IDs (Oversighters only)\n"
+            "• `!OversightBot ping on|off` – Opt‑in/out of pings for new requests "
+            "(Oversighters only)\n"
+            "• `!OversightBot help` – Show this help\n"
+        )
+        await message.reply(help_text, mention_author=False)
+        await bot.process_commands(message)
+        return
+
     if not text.lower().startswith("!oversightbot ping"):
         return
 
