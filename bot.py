@@ -39,9 +39,12 @@ TOKEN: str = os.environ["DISCORD_TOKEN"]
 GUILD_ID: int = int(os.environ["GUILD_ID"])
 RESTRICTED_CHANNEL_ID: int = int(os.environ["RESTRICTED_CHANNEL_ID"])
 
-# Set of user IDs authorized as Oversighters
-OVERSIGHTERS: Set[int] = {
-    int(x.strip()) for x in os.environ["OVERSIGHTERS"].split(",") if x.strip()
+# ---------------------------------------------------------------------
+# IDs provided via ENV are now **bot-admins** only.  Oversighters live
+# in the DB and are maintained at runtime by the bot-admins.
+# ---------------------------------------------------------------------
+BOT_ADMINS: Set[int] = {
+    int(x.strip()) for x in os.getenv("BOT_ADMINS", "").split(",") if x.strip()
 }
 
 # Optional role required to submit oversight requests
@@ -51,6 +54,9 @@ SUBMITTER_ROLE_ID: Optional[int] = (
 
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "600"))
 DB_PATH: str = os.getenv("DB_PATH", "./oversight.sqlite")
+
+# Default (minutes) before an unclaimed request triggers a reminder DM
+REMINDER_MINUTES: int = int(os.getenv("REMINDER_MINUTES", "15"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -76,15 +82,58 @@ def row_to_ext_id(rowid: int) -> int:
     """Convert internal DB rowid to external ticket ID."""
     return rowid + ID_OFFSET
 
+# ===================  Oversighter & Admin helpers  ====================
+
+async def is_oversighter(user_id: int) -> bool:
+    """Return True if user_id is currently an Oversighter."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM oversighters WHERE user_id = ? LIMIT 1", (user_id,)
+        )
+        return await cur.fetchone() is not None
+
+
 def oversighter_check():
-    """Decorator to restrict command usage to configured Oversighters only."""
+    """Decorator that checks current Oversighter status (DB-backed)."""
+
     async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.id not in OVERSIGHTERS:
+        if not await is_oversighter(interaction.user.id):
             raise app_commands.CheckFailure(
                 "You are not configured as an Oversighter."
             )
         return True
+
     return app_commands.check(predicate)
+
+
+def bot_admin_check():
+    """Decorator restricting usage to configured bot-admins only."""
+
+    async def predicate(interaction_or_msg):
+        uid = (
+            interaction_or_msg.user.id
+            if isinstance(interaction_or_msg, discord.Interaction)
+            else interaction_or_msg.author.id
+        )
+        if uid not in BOT_ADMINS:
+            raise app_commands.CheckFailure("You are not a bot admin.")
+        return True
+
+    return commands.check(predicate)  # usable for message commands too
+
+
+async def add_oversighter(user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO oversighters (user_id) VALUES (?)", (user_id,)
+        )
+        await db.commit()
+
+
+async def remove_oversighter(user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM oversighters WHERE user_id = ?", (user_id,))
+        await db.commit()
 
 async def notify_restricted(
     bot: commands.Bot,
@@ -117,7 +166,8 @@ async def init_db() -> None:
                        text        TEXT    NOT NULL,
                        created_at  DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                        claimed_by  INTEGER,
-                       claimed_at  DATETIME
+                       claimed_at  DATETIME,
+                       reminded_at DATETIME
                    )"""
             )
             await db.commit()
@@ -125,6 +175,13 @@ async def init_db() -> None:
             await db.execute(
                 "CREATE TABLE IF NOT EXISTS ping_subscribers ("
                 "user_id INTEGER PRIMARY KEY)"
+            )
+            await db.commit()
+
+            # Table of authorised Oversighters (managed by bot-admins)
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS oversighters ("
+                "  user_id INTEGER PRIMARY KEY)"
             )
             await db.commit()
 
@@ -167,10 +224,13 @@ async def recent_request_count(db, author_id: int) -> int:
 async def create_request(author_id: int, text: str) -> int:
     """Create a new oversight request, enforcing per-user rate limits."""
     async with aiosqlite.connect(DB_PATH) as db:
-        if await recent_request_count(db, author_id) >= 2:
-            raise RuntimeError(
-                f"Rate limit exceeded – max 2 requests every {COOLDOWN_SECONDS}s."
-            )
+        # ── Rate-limit EXEMPTION ────────────────────────────────────────────
+        # Skip the limit if the user is an Oversighter or a bot-admin
+        if not (author_id in BOT_ADMINS or await is_oversighter(author_id)):
+            if await recent_request_count(db, author_id) >= 2:
+                raise RuntimeError(
+                    f"Rate limit exceeded – max 2 requests every {COOLDOWN_SECONDS}s."
+                )
         cur = await db.execute(
             "INSERT INTO requests (author_id, text) VALUES (?, ?)",
             (author_id, text),
@@ -205,6 +265,51 @@ async def list_pending() -> List[int]:
         rows = await cur.fetchall()
         return [row_to_ext_id(r[0]) for r in rows]
 
+# ============================= Reminders ==============================
+
+async def reminder_loop(bot: commands.Bot):
+    """Poll for stale, unclaimed requests and remind their authors."""
+    while not bot.is_closed():
+        cutoff = datetime.utcnow() - timedelta(minutes=REMINDER_MINUTES)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = sqlite3.Row
+            cur = await db.execute(
+                "SELECT id, author_id FROM requests "
+                "WHERE claimed_by IS NULL "
+                "  AND datetime(created_at) < ? "
+                "  AND (reminded_at IS NULL)",
+                (cutoff.isoformat(timespec='seconds'),),
+            )
+            rows = await cur.fetchall()
+
+            for row in rows:
+                ext_id = row_to_ext_id(row["id"])
+                author = await bot.fetch_user(row["author_id"])
+                msg = (
+                    f"⏰ Your Oversight request **{ext_id}** has not been claimed "
+                    f"within {REMINDER_MINUTES} minutes.  If the matter is urgent "
+                    "please follow the instructions at "
+                    "<https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight>."
+                )
+                try:
+                    await author.send(msg)
+                except discord.HTTPException:
+                    pass
+
+                await notify_restricted(
+                    bot,
+                    f"⚠️ Sent unclaimed-request reminder to {author.mention} "
+                    f"for `{ext_id}` (>{REMINDER_MINUTES} min old).",
+                )
+
+                await db.execute(
+                    "UPDATE requests SET reminded_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (row["id"],),
+                )
+            await db.commit()
+
+        await asyncio.sleep(60)  # check each minute
+
 # =========================== Discord Bot Setup ===========================
 
 # Enable message content intent for command handling in restricted channel
@@ -215,6 +320,8 @@ class OversightBot(commands.Bot):
     async def setup_hook(self) -> None:
         # Initialize the database and sync commands on startup
         await init_db()
+        # kick off reminder loop
+        self.reminder_task = asyncio.create_task(reminder_loop(self))
         await self.tree.sync(guild=GUILD_OBJ)
 
 bot = OversightBot(command_prefix="!", intents=intents)
@@ -273,60 +380,78 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     guild=GUILD_OBJ,
 )
 @oversighter_check()
-@app_commands.describe(request_id="Numeric ticket ID (see restricted channel)")
-async def claim(interaction: discord.Interaction, request_id: int):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        row_id = ext_id_to_row(request_id)
-    except ValueError:
-        await interaction.followup.send("⚠️ Invalid ID.", ephemeral=True)
-        return
+@app_commands.describe(request_id="Ticket ID.  Omit to claim *all* unclaimed.")
+# Make the argument optional
+async def claim(interaction: discord.Interaction, request_id: Optional[int] = None):
+    # Helper that actually performs the single-request claim flow
+    async def _claim_one(_row_id: int, first: bool):
+        req = await fetch_request(_row_id)
+        if not req:
+            if first:
+                await interaction.followup.send("⚠️ Unknown request ID.", ephemeral=True)
+            return
 
-    req = await fetch_request(row_id)
-    if not req:
-        await interaction.followup.send("⚠️ Unknown request ID.", ephemeral=True)
-        return
+        # Attempt to claim atomically
+        if not req["claimed_by"]:
+            success = await claim_request(_row_id, interaction.user.id)
+            if not success:
+                req = await fetch_request(_row_id)
 
-    # Attempt to claim the request atomically
-    if not req["claimed_by"]:
-        success = await claim_request(row_id, interaction.user.id)
-        if not success:
-            req = await fetch_request(row_id)
+        if req["claimed_by"] and req["claimed_by"] != interaction.user.id:
+            claimant = await bot.fetch_user(req["claimed_by"])
+            if first:
+                await interaction.followup.send(
+                    f"❌ Already claimed by {claimant.mention}.", ephemeral=True
+                )
+            return
 
-    if req["claimed_by"] and req["claimed_by"] != interaction.user.id:
-        claimant = await bot.fetch_user(req["claimed_by"])
+        # Send details (ephemeral) – only on first or if multiple, show separator
         await interaction.followup.send(
-            f"❌ Already claimed by {claimant.mention}. "
-            "Use `/view` if you still need to read it.",
+            f"📄 **Oversight Request {row_to_ext_id(_row_id)}**\n\n"
+            f"{req['text']}\n\n"
+            f"_Submitted by <@{req['author_id']}>_",
             ephemeral=True,
         )
+
+        # Notify author only on initial claim
+        if req["author_id"]:
+            try:
+                user = await bot.fetch_user(req["author_id"])
+                await user.send(
+                    f"👁️‍🗨️ Your Oversight request **{row_to_ext_id(_row_id)}** was "
+                    f"claimed by {interaction.user.mention}."
+                )
+            except discord.HTTPException:
+                pass
+
+        await notify_restricted(
+            bot,
+            f"✅ Request `{row_to_ext_id(_row_id)}` claimed by {interaction.user.mention}.",
+        )
+
+    # ---------------- Single-ID path ----------------
+    if request_id is not None:
+        try:
+            row_id = ext_id_to_row(request_id)
+        except ValueError:
+            await interaction.followup.send("⚠️ Invalid ID.", ephemeral=True)
+            return
+
+        await _claim_one(row_id, True)
         return
 
-    # Send the request details to the Oversighter inline (ephemeral)
+    # ---------------- Bulk-claim path (/claim with no args) ---------------
+    await interaction.response.defer(ephemeral=True)
+    pending = await list_pending()
+    if not pending:
+        await interaction.followup.send("✅ No unclaimed requests.", ephemeral=True)
+        return
+
     await interaction.followup.send(
-        f"📄 **Oversight Request {request_id}**\n\n"
-        f"{req['text']}\n\n"
-        f"_Submitted by <@{req['author_id']}>_",
-        ephemeral=True,
+        f"🔄 Claiming **{len(pending)}** unclaimed requests …", ephemeral=True
     )
-
-    # Notify the original author that their request was claimed (first claim only)
-    if req["author_id"]:
-        try:
-            user = await bot.fetch_user(req["author_id"])
-            await user.send(
-                f"👁️‍🗨️ Your Oversight request **{request_id}** was claimed by "
-                f"{interaction.user.mention}."
-            )
-        except discord.HTTPException:
-            pass  # Ignore if author does not accept DMs
-
-    # Announce the claim in the restricted channel
-    await notify_restricted(
-        bot,
-        f"✅ Request `{request_id}` claimed by {interaction.user.mention}."
-    )
-    logger.info("Request %s claimed by %s", request_id, interaction.user)
+    for idx, ext_id in enumerate(pending, start=1):
+        await _claim_one(ext_id_to_row(ext_id), idx == 1)
 
 @bot.tree.command(
     name="view",
@@ -389,17 +514,53 @@ async def on_message(message: discord.Message):
 
     text = message.content.strip()
 
+    # ---------------- Oversighter management (bot-admins only) -------------
+    if text.lower().startswith("!oversightbot addos"):
+        if message.author.id not in BOT_ADMINS:
+            await message.reply("Only bot admins may add Oversighters.")
+            return
+        if not message.mentions:
+            await message.reply("Usage: `!OversightBot addos @user`")
+            return
+        added = []
+        for m in message.mentions:
+            await add_oversighter(m.id)
+            added.append(m.mention)
+        await message.reply(
+            f"✅ Added {' '.join(added)} as Oversighter(s).", mention_author=False
+        )
+        return
+
+    if text.lower().startswith("!oversightbot removeos"):
+        if message.author.id not in BOT_ADMINS:
+            await message.reply("Only bot admins may remove Oversighters.")
+            return
+        if not message.mentions:
+            await message.reply("Usage: `!OversightBot removeos @user`")
+            return
+        removed = []
+        for m in message.mentions:
+            await remove_oversighter(m.id)
+            removed.append(m.mention)
+        await message.reply(
+            f"🗑️ Removed {' '.join(removed)} from Oversighters.",
+            mention_author=False,
+        )
+        return
+
     # ----------------------------- HELP COMMAND -----------------------------
     if text.lower().startswith("!oversightbot help"):
         help_text = (
             f"**OversightBot Command Reference**\n"
             f"• `/oversight <text>` – Submit an Oversight request (max 2 every "
-            f"{COOLDOWN_SECONDS}s)\n"
-            "• `/claim <ID>` – Claim & view an unclaimed request (Oversighters only)\n"
+            f"{COOLDOWN_SECONDS}s; *Oversighters & bot-admins exempt*)\n"
+            "• `/claim [ID]` – Claim one request or **every** pending request if no ID\n"
             "• `/view <ID>` – View any request by ID (Oversighters only)\n"
             "• `/pending` – List unclaimed request IDs (Oversighters only)\n"
             "• `!OversightBot ping on|off` – Opt‑in/out of pings for new requests "
             "(Oversighters only)\n"
+            "• `!OversightBot addos @u` / `removeos @u` – Manage Oversighters "
+            "(bot admins only)\n"
             "• `!OversightBot help` – Show this help\n"
         )
         await message.reply(help_text, mention_author=False)
@@ -409,8 +570,8 @@ async def on_message(message: discord.Message):
     if not text.lower().startswith("!oversightbot ping"):
         return
 
-    # Only allow configured Oversighters to change ping settings
-    if message.author.id not in OVERSIGHTERS:
+    # Only Oversighters may toggle pings
+    if not await is_oversighter(message.author.id):
         await message.reply(
             "Only configured Oversighters can change ping settings.",
             mention_author=False,
