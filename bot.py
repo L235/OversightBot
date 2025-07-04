@@ -360,7 +360,7 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     # Confirm submission and echo back the request for verification
     await interaction.followup.send(
         f"✅ Your request has been filed with ID **{ticket_id}**.\n\n"
-        f"**You submitted:**\n> {request_text}\n\n",
+        f"**You submitted:**\n> {request_text}\n\n"
         "If the request is not processed by an Oversighter in ~15 minutes, "
         "please follow the instructions at "
         "<https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight>.",
