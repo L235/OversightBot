@@ -287,7 +287,7 @@ async def reminder_loop(bot: commands.Bot):
                 author = await bot.fetch_user(row["author_id"])
                 request_text = row["text"]
                 msg = (
-                    f"⏰ Your Oversight request **{ext_id}** has not been claimed "
+                    f"⏰ Your Oversight request #**{ext_id}** has not been claimed "
                     f"within {REMINDER_MINUTES} minutes.\n\n"
                     f"**Your original request:**\n> {request_text}\n\n"
                     "Please consider submitting the request through other channels "
@@ -413,7 +413,7 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
 
         # Send details (ephemeral) – only on first or if multiple, show separator
         await interaction.followup.send(
-            f"📄 **Oversight Request {row_to_ext_id(_row_id)}**\n\n"
+            f"**Oversight Request #{row_to_ext_id(_row_id)}**\n\n"
             f"{req['text']}\n\n"
             f"_Submitted by <@{req['author_id']}>_",
             ephemeral=True,
@@ -424,15 +424,15 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
             try:
                 user = await bot.fetch_user(req["author_id"])
                 await user.send(
-                    f"👁️‍🗨️ Your Oversight request **{row_to_ext_id(_row_id)}** was "
-                    f"claimed by {interaction.user.mention}."
+                    f"👁️‍🗨️ Your Oversight request #**{row_to_ext_id(_row_id)}** was "
+                    f"claimed by Oversighter {interaction.user.mention}."
                 )
             except discord.HTTPException:
                 pass
 
         await notify_restricted(
             bot,
-            f"✅ Request `{row_to_ext_id(_row_id)}` claimed by {interaction.user.mention}.",
+            f"✅ Request #`{row_to_ext_id(_row_id)}` claimed by {interaction.user.mention}.",
         )
 
     # ---------------- Single-ID path ----------------
