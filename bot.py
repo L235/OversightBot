@@ -66,7 +66,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("oversight-bot")
 
-# External ticket IDs start at 101 for user-facing clarity
+# External ticket IDs start at some offset (currently 0) for user-facing clarity
 ID_OFFSET = 0
 
 # ===================== Utility and Permission Helpers =====================
@@ -274,7 +274,7 @@ async def reminder_loop(bot: commands.Bot):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = sqlite3.Row
             cur = await db.execute(
-                "SELECT id, author_id FROM requests "
+                "SELECT id, author_id, text FROM requests "
                 "WHERE claimed_by IS NULL "
                 "  AND datetime(created_at) < ? "
                 "  AND (reminded_at IS NULL)",
@@ -285,10 +285,13 @@ async def reminder_loop(bot: commands.Bot):
             for row in rows:
                 ext_id = row_to_ext_id(row["id"])
                 author = await bot.fetch_user(row["author_id"])
+                request_text = row["text"]
                 msg = (
                     f"⏰ Your Oversight request **{ext_id}** has not been claimed "
-                    f"within {REMINDER_MINUTES} minutes.  If the matter is urgent "
-                    "please follow the instructions at "
+                    f"within {REMINDER_MINUTES} minutes.\n\n"
+                    f"**Your original request:**\n> {request_text}\n\n"
+                    "Please consider submitting the request through other channels "
+                    "by following the instructions at "
                     "<https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight>."
                 )
                 try:
@@ -357,7 +360,10 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     # Confirm submission and echo back the request for verification
     await interaction.followup.send(
         f"✅ Your request has been filed with ID **{ticket_id}**.\n\n"
-        f"**You submitted:**\n> {request_text}",
+        f"**You submitted:**\n> {request_text}\n\n",
+        "If the request is not processed by an Oversighter in ~15 minutes, "
+        "please follow the instructions at "
+        "<https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight>.",
         ephemeral=True,
     )
 
@@ -365,10 +371,10 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     await notify_restricted(
         bot,
         (
-            "🔔 **New Oversight Request**\n"
+            "**New Oversight Request**\n"
             f"• ID: `{ticket_id}`\n"
             f"• From: {interaction.user.mention}\n"
-            "Oversighters may claim it with `/claim <ID>`."
+            "Oversighters may claim all pending requests with `/claim`."
         ),
         ping_new=True,
     )
