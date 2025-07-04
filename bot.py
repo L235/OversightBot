@@ -1,16 +1,16 @@
 # oversight_bot.py
 #
 # A Discord bot to intake English‑Wikipedia Oversight requests and deliver them
-# only to users who hold the “Oversighter” role in a designated restricted
+# only to users who hold the "Oversighter" role in a designated restricted
 # channel.  Secrets and configuration come exclusively from environment vars.
-# oversight_bot.py  – v2
+# oversight_bot.py  – v2
 #
 # A Discord bot for handling English‑Wikipedia Oversight requests.
 # Changes from v1:
 #   • Oversighters listed in ENV rather than role‑based gating
 #   • Author is notified when a request is *viewed* by a named Oversighter
-#   • /pending – list all unclaimed requests
-#   • /view   – lets Oversighters read an already‑claimed request (logged privately)
+#   • /pending – list all unclaimed requests
+#   • /view  – lets Oversighters read an already‑claimed request (logged privately)
 #   • Numeric ticket IDs, starting at 101
 #   • Per‑user rate‑limit: max 2 requests per <COOLDOWN_SECONDS>
 #   • Requests stored in a lightweight SQLite file (path from ENV)
@@ -27,7 +27,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# ───────────────────────── 1 • Configuration ────────────────────────── #
+# ───────────────────────── 1 • Configuration ────────────────────────── #
 
 TOKEN: str = os.environ["DISCORD_TOKEN"]
 
@@ -57,7 +57,7 @@ logger = logging.getLogger("oversight-bot")
 # Numeric IDs start at 101
 ID_OFFSET = 100  # external‑ID 101 corresponds to internal rowid 1
 
-# ──────────────────── 2 • Utility / permission helpers ───────────────── #
+# ──────────────────── 2 • Utility / permission helpers ───────────────── #
 
 def ext_id_to_row(ext_id: int) -> int:
     """User‑facing ID → DB rowid (raises ValueError if out of range)."""
@@ -78,12 +78,23 @@ def oversighter_check():
         return True
     return app_commands.check(predicate)
 
-async def notify_restricted(bot: commands.Bot, content: str) -> None:
+async def notify_restricted(
+    bot: commands.Bot,
+    content: str,
+    ping_new: bool = False,      # ping only on brand-new requests
+) -> None:
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
-    if chan:
-        await chan.send(content)
+    if not chan:
+        return
 
-# ───────────────────────── 3 • Database layer (SQLite) ────────────────── #
+    if ping_new:
+        subs = await get_ping_subs()
+        if subs:  # append mentions
+            content += " " + " ".join(f"<@{uid}>" for uid in subs)
+
+    await chan.send(content)
+
+# ───────────────────────── 3 • Database layer (SQLite) ────────────────── #
 
 DB_LOCK = asyncio.Lock()   # avoids simultaneous schema setup on first run
 
@@ -101,6 +112,36 @@ async def init_db() -> None:
                    )"""
             )
             await db.commit()
+
+            # ── NEW: table to store ping-opt-in users ─────────────────── #
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS ping_subscribers ("
+                "user_id INTEGER PRIMARY KEY)"
+            )
+            await db.commit()
+
+# ─────────────────────── Ping-subscriber helpers ─────────────────────── #
+
+async def add_ping_sub(user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO ping_subscribers (user_id) VALUES (?)",
+            (user_id,),
+        )
+        await db.commit()
+
+async def remove_ping_sub(user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM ping_subscribers WHERE user_id = ?", (user_id,)
+        )
+        await db.commit()
+
+async def get_ping_subs() -> List[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM ping_subscribers")
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
 
 async def recent_request_count(db, author_id: int) -> int:
     window = datetime.now(timezone.utc) - timedelta(seconds=COOLDOWN_SECONDS)
@@ -154,9 +195,11 @@ async def list_pending() -> List[int]:
         rows = await cur.fetchall()
         return [row_to_ext_id(r[0]) for r in rows]
 
-# ───────────────────────── 4 • Discord bot setup ──────────────────────── #
+# ───────────────────────── 4 • Discord bot setup ──────────────────────── #
 
+# We now need message-content intent for the "!OversightBot ping" commands
 intents = discord.Intents.default()
+intents.message_content = True
 
 class OversightBot(commands.Bot):
     async def setup_hook(self) -> None:
@@ -167,7 +210,7 @@ class OversightBot(commands.Bot):
 bot = OversightBot(command_prefix="!", intents=intents)
 GUILD_OBJ = discord.Object(id=GUILD_ID)
 
-# ───────────────────────── 5 • /oversight command ─────────────────────── #
+# ───────────────────────── 5 • /oversight command ─────────────────────── #
 
 @bot.tree.command(
     name="oversight",
@@ -197,8 +240,8 @@ async def oversight(interaction: discord.Interaction, request_text: str):
 
     # Confirm to the submitter
     await interaction.followup.send(
-        f"✅ Your request has been filed with ID **{ticket_id}**. "
-        "An Oversighter will review it shortly.",
+        f"✅ Your request has been filed with ID **{ticket_id}**.\n\n"
+        f"**You submitted:**\n> {request_text}",
         ephemeral=True,
     )
 
@@ -211,10 +254,11 @@ async def oversight(interaction: discord.Interaction, request_text: str):
             f"• From: {interaction.user.mention}\n"
             "Oversighters may claim it with `/claim <ID>`."
         ),
+        ping_new=True,          # ← trigger optional pings
     )
     logger.info("Request %s submitted by %s", ticket_id, interaction.user)
 
-# ──────────────────────── 6 • /claim (Oversighters) ───────────────────── #
+# ──────────────────────── 6 • /claim (Oversighters) ───────────────────── #
 
 @bot.tree.command(
     name="claim",
@@ -285,7 +329,7 @@ async def claim(interaction: discord.Interaction, request_id: int):
     await interaction.followup.send("📬 I've sent the request to your DMs.", ephemeral=True)
     logger.info("Request %s claimed by %s", request_id, interaction.user)
 
-# ───────────────────────── 7 • /view (claimed) ────────────────────────── #
+# ───────────────────────── 7 • /view (claimed) ────────────────────────── #
 
 @bot.tree.command(
     name="view",
@@ -330,7 +374,7 @@ async def view(interaction: discord.Interaction, request_id: int):
     await interaction.followup.send("✅ Check your DMs – request delivered.", ephemeral=True)
     logger.info("Request %s viewed by %s (status: %s)", request_id, interaction.user, status)
 
-# ──────────────────────── 8 • /pending (unclaimed) ────────────────────── #
+# ──────────────────────── 8 • /pending (unclaimed) ────────────────────── #
 
 @bot.tree.command(
     name="pending",
@@ -343,7 +387,52 @@ async def pending(interaction: discord.Interaction):
     text = "🔗 **Unclaimed requests:** " + (", ".join(f"`{i}`" for i in ids) or "*(none)*")
     await interaction.response.send_message(text, ephemeral=True)
 
-# ───────────────────────── 9 • Error handler ──────────────────────────── #
+# ─────────────────────── "!OversightBot ping" handler ─────────────────── #
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.channel.id != RESTRICTED_CHANNEL_ID:
+        return
+
+    text = message.content.strip()
+    if not text.lower().startswith("!oversightbot ping"):
+        return
+
+    # Only configured Oversighters may opt-in/out
+    if message.author.id not in OVERSIGHTERS:
+        await message.reply(
+            "Only configured Oversighters can change ping settings.",
+            mention_author=False,
+        )
+        return
+
+    parts = text.lower().split()
+    if len(parts) < 3 or parts[2] not in ("on", "off"):
+        await message.reply(
+            "Usage: `!OversightBot ping on` or `!OversightBot ping off`",
+            mention_author=False,
+        )
+        return
+
+    if parts[2] == "on":
+        await add_ping_sub(message.author.id)
+        await message.reply(
+            "🔔 You'll be pinged for new Oversight requests.",
+            mention_author=False,
+        )
+    else:  # "off"
+        await remove_ping_sub(message.author.id)
+        await message.reply(
+            "🔕 You will no longer receive pings.",
+            mention_author=False,
+        )
+
+    # Let slash-command processing continue (not strictly needed here)
+    await bot.process_commands(message)
+
+# ───────────────────────── 9 • Error handler ──────────────────────────── #
 
 @claim.error
 @view.error
@@ -355,7 +444,7 @@ async def oversight_error(interaction: discord.Interaction, error):
         logger.exception("Unhandled error:", exc_info=error)
         await interaction.response.send_message("Unexpected error occurred.", ephemeral=True)
 
-# ───────────────────────── 10 • Start‑up hooks ────────────────────────── #
+# ───────────────────────── 10 • Start‑up hooks ────────────────────────── #
 
 @bot.event
 async def on_ready():
