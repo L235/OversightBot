@@ -435,6 +435,8 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
             f"✅ Request #`{row_to_ext_id(_row_id)}` claimed by {interaction.user.mention}.",
         )
 
+    # Defer the response to avoid race conditions
+    await interaction.response.defer(ephemeral=True)
     # ---------------- Single-ID path ----------------
     if request_id is not None:
         try:
@@ -447,7 +449,6 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
         return
 
     # ---------------- Bulk-claim path (/claim with no args) ---------------
-    await interaction.response.defer(ephemeral=True)
     pending = await list_pending()
     if not pending:
         await interaction.followup.send("✅ No unclaimed requests.", ephemeral=True)
