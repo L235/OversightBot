@@ -164,10 +164,10 @@ async def init_db() -> None:
                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
                        author_id   INTEGER NOT NULL,
                        text        TEXT    NOT NULL,
-                       created_at  DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                       created_at  INTEGER  DEFAULT (strftime('%s','now')),
                        claimed_by  INTEGER,
-                       claimed_at  DATETIME,
-                       reminded_at DATETIME
+                       claimed_at  INTEGER,
+                       reminded_at INTEGER
                    )"""
             )
             await db.commit()
@@ -212,11 +212,11 @@ async def get_ping_subs() -> List[int]:
 
 async def recent_request_count(db, author_id: int) -> int:
     """Count how many requests a user has submitted within the cooldown window."""
-    window = datetime.now(timezone.utc) - timedelta(seconds=COOLDOWN_SECONDS)
+    window_ts = int(datetime.now(timezone.utc).timestamp()) - COOLDOWN_SECONDS
     cur = await db.execute(
         "SELECT COUNT(*) FROM requests "
         "WHERE author_id = ? AND created_at >= ?",
-        (author_id, window.isoformat(timespec="seconds")),
+        (author_id, window_ts),
     )
     (cnt,) = await cur.fetchone()
     return cnt
@@ -231,9 +231,10 @@ async def create_request(author_id: int, text: str) -> int:
                 raise RuntimeError(
                     f"Rate limit exceeded – max 2 requests every {COOLDOWN_SECONDS}s."
                 )
+        now_ts = int(datetime.now(timezone.utc).timestamp())
         cur = await db.execute(
-            "INSERT INTO requests (author_id, text) VALUES (?, ?)",
-            (author_id, text),
+            "INSERT INTO requests (author_id, text, created_at) VALUES (?, ?, ?)",
+            (author_id, text, now_ts),
         )
         await db.commit()
         return row_to_ext_id(cur.lastrowid)
@@ -248,10 +249,11 @@ async def fetch_request(row_id: int) -> Optional[sqlite3.Row]:
 async def claim_request(row_id: int, claimer_id: int) -> bool:
     """Attempt to atomically claim a request. Returns True if successful, False if already claimed."""
     async with aiosqlite.connect(DB_PATH) as db:
+        now_ts = int(datetime.now(timezone.utc).timestamp())
         cur = await db.execute(
-            "UPDATE requests SET claimed_by = ?, claimed_at = CURRENT_TIMESTAMP "
+            "UPDATE requests SET claimed_by = ?, claimed_at = ? "
             "WHERE id = ? AND claimed_by IS NULL",
-            (claimer_id, row_id),
+            (claimer_id, now_ts, row_id),
         )
         await db.commit()
         return cur.rowcount == 1
@@ -270,15 +272,15 @@ async def list_pending() -> List[int]:
 async def reminder_loop(bot: commands.Bot):
     """Poll for stale, unclaimed requests and remind their authors."""
     while not bot.is_closed():
-        cutoff = datetime.utcnow() - timedelta(minutes=REMINDER_MINUTES)
+        cutoff_ts = int(datetime.utcnow().timestamp()) - REMINDER_MINUTES * 60
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = sqlite3.Row
             cur = await db.execute(
                 "SELECT id, author_id, text FROM requests "
                 "WHERE claimed_by IS NULL "
-                "  AND datetime(created_at) < ? "
+                "  AND created_at < ? "
                 "  AND (reminded_at IS NULL)",
-                (cutoff.isoformat(timespec='seconds'),),
+                (cutoff_ts,),
             )
             rows = await cur.fetchall()
 
@@ -305,9 +307,10 @@ async def reminder_loop(bot: commands.Bot):
                     f"for `{ext_id}` (>{REMINDER_MINUTES} min old).",
                 )
 
+                now_ts = int(datetime.utcnow().timestamp())
                 await db.execute(
-                    "UPDATE requests SET reminded_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (row["id"],),
+                    "UPDATE requests SET reminded_at = ? WHERE id = ?",
+                    (now_ts, row["id"]),
                 )
             await db.commit()
 
@@ -361,7 +364,8 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     await interaction.followup.send(
         f"✅ Your request has been filed with ID **{ticket_id}**.\n\n"
         f"**You submitted:**\n> {request_text}\n\n"
-        "If the request is not processed by an Oversighter in ~15 minutes, "
+        "You will be notified when the request is claimed by an Oversighter.\n"
+        "If the request is not claimed by an Oversighter in ~15 minutes, "
         "please follow the instructions at "
         "<https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight>.",
         ephemeral=True,
