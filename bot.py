@@ -65,11 +65,11 @@ SUCCESS = {
         "<https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight>."
     ),
     "no_unclaimed": "✅ No unclaimed requests.",
-    "claiming_multiple": "🔄 Claiming **{count}** unclaimed requests …",
-    "added_oversighters": "✅ Added {users} as Oversighter(s).",
-    "removed_oversighters": "🗑️ Removed {users} from Oversighters.",
-    "ping_enabled": "🔔 You'll be pinged for new Oversight requests.",
-    "ping_disabled": "🔕 You will no longer receive pings.",
+    "claiming_multiple": "🔄 Claiming {count} unclaimed requests …",
+    "added_oversighters": "Added {users} as Oversighter(s).",
+    "removed_oversighters": "Removed {users} from Oversighters.",
+    "ping_enabled": "You'll be pinged for new Oversight requests.",
+    "ping_disabled": "You will no longer receive pings.",
 }
 
 # Information and notification messages
@@ -107,7 +107,7 @@ RESTRICTED = {
         "Oversighters may claim all pending requests with `/claim`."
     ),
     "request_claimed": "✅ Request #{request_id} claimed by {claimer}.",
-    "request_viewed": "👓 {viewer} viewed {status} request #{request_id}.",
+    "request_viewed": "{viewer} viewed {status} request #{request_id}.",
     "reminder_sent": (
         "Sent unclaimed-request notice to {user_mention} "
         "for #{request_id} (>{minutes} min old)."
