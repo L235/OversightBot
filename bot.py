@@ -45,7 +45,7 @@ ERRORS = {
     "rate_limit_exceeded": "⏳ Rate limit exceeded – max 2 requests every {cooldown}s.",
     "unknown_request_id": "⚠️ Unknown request ID.",
     "invalid_id": "⚠️ Invalid ID.",
-    "already_claimed": "❌ Already claimed by {claimant}.",
+    "already_claimed": "Already claimed by {claimant}. Showing details below instead.",
     "not_oversighter": "You are not configured as an Oversighter.",
     "not_bot_admin": "You are not a bot admin.",
     "only_bot_admins_add": "Only bot admins may add Oversighters.",
@@ -70,6 +70,10 @@ SUCCESS = {
     "removed_oversighters": "Removed {users} from Oversighters.",
     "ping_enabled": "You'll be pinged for new Oversight requests.",
     "ping_disabled": "You will no longer receive pings.",
+    "follow_up_note": (
+        "Please follow up directly with the requester to inform them of the "
+        "disposition of their request or to request additional information."
+    ),
 }
 
 # Information and notification messages
@@ -490,37 +494,62 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
                 await interaction.followup.send(ERRORS["unknown_request_id"], ephemeral=True)
             return
 
-        # Attempt to claim atomically
+        # Try to claim atomically
+        success = False
         if not req["claimed_by"]:
             success = await claim_request(_row_id, interaction.user.id)
-            if not success:
-                req = await fetch_request(_row_id)
+            if success:
+                req = await fetch_request(_row_id)  # refresh with claimer info
 
-        if req["claimed_by"] and req["claimed_by"] != interaction.user.id:
+        # ----- If already claimed (by anyone), show details like /view -----
+        if req["claimed_by"] and not success:
             claimant = await bot.fetch_user(req["claimed_by"])
             if first:
-                await interaction.followup.send(ERRORS["already_claimed"].format(claimant=claimant.mention), ephemeral=True)
+                await interaction.followup.send(
+                    ERRORS["already_claimed"].format(claimant=claimant.mention),
+                    ephemeral=True,
+                )
+            await interaction.followup.send(
+                INFO["view_request_details"].format(
+                    request_id=row_to_ext_id(_row_id),
+                    text=req["text"],
+                    author_id=req["author_id"],
+                ),
+                ephemeral=True,
+            )
             return
 
-        # Send details (ephemeral) – only on first or if multiple, show separator
+        # ----- Newly claimed by the caller -----
         await interaction.followup.send(
-            INFO["request_details"].format(request_id=row_to_ext_id(_row_id), text=req["text"], author_id=req["author_id"]),
+            INFO["request_details"].format(
+                request_id=row_to_ext_id(_row_id),
+                text=req["text"],
+                author_id=req["author_id"],
+            )
+            + f"\n\n{SUCCESS['follow_up_note']}",
             ephemeral=True,
         )
 
-        # Notify author only on initial claim
+        # Notify author only on *new* claim
         if req["author_id"]:
             try:
                 user = await bot.fetch_user(req["author_id"])
                 await user.send(
-                    INFO["request_claimed_notification"].format(request_id=row_to_ext_id(_row_id), claimer=interaction.user.mention)
+                    INFO["request_claimed_notification"].format(
+                        request_id=row_to_ext_id(_row_id),
+                        claimer=interaction.user.mention,
+                    )
                 )
             except discord.HTTPException:
                 pass
 
+        # Announce in restricted channel only for newly-claimed requests
         await notify_restricted(
             bot,
-            RESTRICTED["request_claimed"].format(request_id=row_to_ext_id(_row_id), claimer=interaction.user.mention),
+            RESTRICTED["request_claimed"].format(
+                request_id=row_to_ext_id(_row_id),
+                claimer=interaction.user.mention,
+            ),
         )
 
     # Defer the response to avoid race conditions
@@ -554,9 +583,28 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
     guild=GUILD_OBJ,
 )
 @oversighter_check()
-@app_commands.describe(request_id="Numeric ticket ID")
-async def view(interaction: discord.Interaction, request_id: int):
+@app_commands.describe(request_id="Numeric ticket ID.  Omit to view *all* unclaimed.")
+async def view(interaction: discord.Interaction, request_id: Optional[int] = None):
     await interaction.response.defer(ephemeral=True)
+    # ---------- View ALL unclaimed if no ID ----------
+    if request_id is None:
+        pending = await list_pending()
+        if not pending:
+            await interaction.followup.send(SUCCESS["no_unclaimed"], ephemeral=True)
+            return
+        for ext_id in pending:
+            req = await fetch_request(ext_id_to_row(ext_id))
+            await interaction.followup.send(
+                INFO["view_request_details"].format(
+                    request_id=ext_id,
+                    text=req["text"],
+                    author_id=req["author_id"],
+                ),
+                ephemeral=True,
+            )
+        return
+
+    # ---------- View single ID ----------
     try:
         row_id = ext_id_to_row(request_id)
     except ValueError:
@@ -567,21 +615,16 @@ async def view(interaction: discord.Interaction, request_id: int):
     if not req:
         await interaction.followup.send(ERRORS["unknown_request_id"], ephemeral=True)
         return
-    unclaimed = req["claimed_by"] is None
 
-    # Send the request details to the Oversighter inline (ephemeral)
     await interaction.followup.send(
-        INFO["view_request_details"].format(request_id=request_id, text=req["text"], author_id=req["author_id"]),
+        INFO["view_request_details"].format(
+            request_id=request_id,
+            text=req["text"],
+            author_id=req["author_id"],
+        ),
         ephemeral=True,
     )
-
-    # Announce the view in the restricted channel, indicating claim status
-    status = "unclaimed" if unclaimed else "claimed"
-    await notify_restricted(
-        bot,
-        RESTRICTED["request_viewed"].format(viewer=interaction.user.mention, status=status, request_id=request_id)
-    )
-    logger.info("Request %s viewed by %s (status: %s)", request_id, interaction.user, status)
+    # No channel notification for /view (requirement 4)
 
 @bot.tree.command(
     name="pending",
