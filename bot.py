@@ -118,7 +118,7 @@ RESTRICTED = {
 HELP = {
     "command_reference": (
         "**OversightBot Command Reference**\n"
-        "• `/oversight <text>` – Submit an Oversight request (max 2 every "
+        "• `{oversight_cmd} <text>` – Submit an Oversight request (max 2 every "
         "{cooldown}s; *Oversighters & bot-admins exempt*)\n"
         "• `/claim [ID]` – Claim one request or **every** pending request if no ID\n"
         "• `/view <ID>` – View any request by ID (Oversighters only)\n"
@@ -173,9 +173,10 @@ ID_OFFSET = 0
 # ---------------------------------------------------------------------
 # Slash-command mentions
 # ---------------------------------------------------------------------
-# This will be replaced at runtime (after command-sync) with the clickable
-# mention for the `/claim` application command, e.g. "</claim:123456789012345678>"
+# These placeholders are overwritten at runtime (after command-sync) with
+# fully-qualified, *clickable* mentions, e.g. "</claim:123...>".
 CLAIM_MENTION: str = "/claim"
+OVERSIGHT_MENTION: str = "/oversight"
 
 # ===================== Utility and Permission Helpers =====================
 
@@ -438,11 +439,16 @@ class OversightBot(commands.Bot):
         self.reminder_task = asyncio.create_task(reminder_loop(self))
         await self.tree.sync(guild=GUILD_OBJ)
 
-        # Cache a clickable mention for the /claim command once IDs are known
-        cmd = self.tree.get_command("claim")
-        if cmd:
+        # Cache clickable mentions for frequently referenced commands
+        claim_cmd = self.tree.get_command("claim")
+        if claim_cmd:
             global CLAIM_MENTION
-            CLAIM_MENTION = cmd.mention
+            CLAIM_MENTION = claim_cmd.mention
+
+        oversight_cmd = self.tree.get_command("oversight")
+        if oversight_cmd:
+            global OVERSIGHT_MENTION
+            OVERSIGHT_MENTION = oversight_cmd.mention
 
 bot = OversightBot(command_prefix="!", intents=intents)
 GUILD_OBJ = discord.Object(id=GUILD_ID)
@@ -656,7 +662,7 @@ async def on_message(message: discord.Message):
 
     # ----------------------------- HELP COMMAND -----------------------------
     if text.lower().startswith("!oversightbot help"):
-        help_text = HELP["command_reference"].format(cooldown=COOLDOWN_SECONDS)
+        help_text = HELP["command_reference"].format(cooldown=COOLDOWN_SECONDS, oversight_cmd=OVERSIGHT_MENTION)
         await message.reply(help_text, mention_author=False)
         await bot.process_commands(message)
         return
