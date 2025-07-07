@@ -80,7 +80,7 @@ INFO = {
     ),
     "reminder_message": (
         "Your Oversight request #{request_id} has not been claimed "
-        "within {minutes} minutes.\n\n"
+        "by an Oversighterwithin {minutes} minutes.\n\n"
         "**Your original request:**\n> {request_text}\n\n"
         "Please consider submitting the request through other channels "
         "by following the instructions at "
