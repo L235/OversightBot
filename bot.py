@@ -104,7 +104,7 @@ RESTRICTED = {
         "**New Oversight Request**\n"
         "• ID: #{ticket_id}\n"
         "• From: {user_mention}\n"
-        "Oversighters may claim all pending requests with `/claim`."
+        "Oversighters may claim all pending requests with {claim_mention}."
     ),
     "request_claimed": "✅ Request #{request_id} claimed by {claimer}.",
     "request_viewed": "{viewer} viewed {status} request #{request_id}.",
@@ -169,6 +169,13 @@ logger = logging.getLogger("oversight-bot")
 
 # External ticket IDs start at some offset (currently 0) for user-facing clarity
 ID_OFFSET = 0
+
+# ---------------------------------------------------------------------
+# Slash-command mentions
+# ---------------------------------------------------------------------
+# This will be replaced at runtime (after command-sync) with the clickable
+# mention for the `/claim` application command, e.g. "</claim:123456789012345678>"
+CLAIM_MENTION: str = "/claim"
 
 # ===================== Utility and Permission Helpers =====================
 
@@ -431,6 +438,12 @@ class OversightBot(commands.Bot):
         self.reminder_task = asyncio.create_task(reminder_loop(self))
         await self.tree.sync(guild=GUILD_OBJ)
 
+        # Cache a clickable mention for the /claim command once IDs are known
+        cmd = self.tree.get_command("claim")
+        if cmd:
+            global CLAIM_MENTION
+            CLAIM_MENTION = cmd.mention
+
 bot = OversightBot(command_prefix="!", intents=intents)
 GUILD_OBJ = discord.Object(id=GUILD_ID)
 
@@ -468,7 +481,7 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     # Notify Oversighters in the restricted channel, pinging opted-in users
     await notify_restricted(
         bot,
-        RESTRICTED["new_request"].format(ticket_id=ticket_id, user_mention=interaction.user.mention),
+        RESTRICTED["new_request"].format(ticket_id=ticket_id, user_mention=interaction.user.mention, claim_mention=CLAIM_MENTION),
         ping_new=True,
     )
     logger.info("Request %s submitted by %s", ticket_id, interaction.user)
