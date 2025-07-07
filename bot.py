@@ -104,7 +104,7 @@ RESTRICTED = {
         "**New Oversight Request**\n"
         "• ID: #{ticket_id}\n"
         "• From: {user_mention}\n"
-        "Oversighters may claim all pending requests with {claim_mention}."
+        "Oversighters may claim all pending requests with `/claim`."
     ),
     "request_claimed": "✅ Request #{request_id} claimed by {claimer}.",
     "request_viewed": "{viewer} viewed {status} request #{request_id}.",
@@ -118,7 +118,7 @@ RESTRICTED = {
 HELP = {
     "command_reference": (
         "**OversightBot Command Reference**\n"
-        "• `{oversight_cmd} <text>` – Submit an Oversight request (max 2 every "
+        "• `/oversight <text>` – Submit an Oversight request (max 2 every "
         "{cooldown}s; *Oversighters & bot-admins exempt*)\n"
         "• `/claim [ID]` – Claim one request or **every** pending request if no ID\n"
         "• `/view <ID>` – View any request by ID (Oversighters only)\n"
@@ -148,6 +148,15 @@ BOT_ADMINS: Set[int] = {
     int(x.strip()) for x in os.getenv("BOT_ADMINS", "").split(",") if x.strip()
 }
 
+# ---------------------------------------------------------------------
+# Slash-command mentions
+# ---------------------------------------------------------------------
+# This will be replaced at runtime (after command-sync) with the clickable
+# mention for the `/claim` application command, e.g. "</claim:123456789012345678>"
+CLAIM_MENTION: str = "/claim"
+# This will likewise be replaced with the clickable mention for `/oversight`
+OVERSIGHT_MENTION: str = "/oversight"
+
 # Optional role required to submit oversight requests
 SUBMITTER_ROLE_ID: Optional[int] = (
     int(os.getenv("SUBMITTER_ROLE_ID")) if os.getenv("SUBMITTER_ROLE_ID") else None
@@ -169,14 +178,6 @@ logger = logging.getLogger("oversight-bot")
 
 # External ticket IDs start at some offset (currently 0) for user-facing clarity
 ID_OFFSET = 0
-
-# ---------------------------------------------------------------------
-# Slash-command mentions
-# ---------------------------------------------------------------------
-# These placeholders are overwritten at runtime (after command-sync) with
-# fully-qualified, *clickable* mentions, e.g. "</claim:123...>".
-CLAIM_MENTION: str = "/claim"
-OVERSIGHT_MENTION: str = "/oversight"
 
 # ===================== Utility and Permission Helpers =====================
 
@@ -438,17 +439,28 @@ class OversightBot(commands.Bot):
         # kick off reminder loop
         self.reminder_task = asyncio.create_task(reminder_loop(self))
         await self.tree.sync(guild=GUILD_OBJ)
-
-        # Cache clickable mentions for frequently referenced commands
-        claim_cmd = self.tree.get_command("claim")
-        if claim_cmd:
+        
+        # Cache a clickable mention for the /claim command once IDs are known
+        cmd = self.tree.get_command("claim")
+        if cmd:
             global CLAIM_MENTION
-            CLAIM_MENTION = claim_cmd.mention
+            CLAIM_MENTION = cmd.mention
 
-        oversight_cmd = self.tree.get_command("oversight")
-        if oversight_cmd:
+        # Cache a clickable mention for the /oversight command
+        cmd = self.tree.get_command("oversight")
+        if cmd:
             global OVERSIGHT_MENTION
-            OVERSIGHT_MENTION = oversight_cmd.mention
+            OVERSIGHT_MENTION = cmd.mention
+
+        # Update presence so the bot's user-details panel advertises the command
+        # (The activity text appears when you click/hover the bot in the member list.
+        # Including the slash-command mention makes it directly clickable.)
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name=f"Use {OVERSIGHT_MENTION} to submit requests",
+            )
+        )
 
 bot = OversightBot(command_prefix="!", intents=intents)
 GUILD_OBJ = discord.Object(id=GUILD_ID)
@@ -487,7 +499,7 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     # Notify Oversighters in the restricted channel, pinging opted-in users
     await notify_restricted(
         bot,
-        RESTRICTED["new_request"].format(ticket_id=ticket_id, user_mention=interaction.user.mention, claim_mention=CLAIM_MENTION),
+        RESTRICTED["new_request"].format(ticket_id=ticket_id, user_mention=interaction.user.mention),
         ping_new=True,
     )
     logger.info("Request %s submitted by %s", ticket_id, interaction.user)
@@ -662,7 +674,7 @@ async def on_message(message: discord.Message):
 
     # ----------------------------- HELP COMMAND -----------------------------
     if text.lower().startswith("!oversightbot help"):
-        help_text = HELP["command_reference"].format(cooldown=COOLDOWN_SECONDS, oversight_cmd=OVERSIGHT_MENTION)
+        help_text = HELP["command_reference"].format(cooldown=COOLDOWN_SECONDS)
         await message.reply(help_text, mention_author=False)
         await bot.process_commands(message)
         return
