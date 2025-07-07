@@ -104,13 +104,13 @@ INFO = {
 
 # Restricted channel notifications
 RESTRICTED = {
-    "new_request": (
-        "**New Oversight Request**\n"
-        "• ID: #{ticket_id}\n"
-        "• From: {user_mention}\n"
+    "request": (
+        "**Oversight Request**\n"
+        "- ID: #{ticket_id}\n"
+        "- Status: {status}\n"
+        "- From: {user_mention}\n"
         "Oversighters may claim all pending requests with `/claim`."
     ),
-    "request_claimed": "✅ Request #{request_id} claimed by {claimer}.",
     "request_viewed": "{viewer} viewed {status} request #{request_id}.",
     "reminder_sent": (
         "Sent unclaimed-request notice to {user_mention} "
@@ -122,16 +122,16 @@ RESTRICTED = {
 HELP = {
     "command_reference": (
         "**OversightBot Command Reference**\n"
-        "• `/oversight <text>` – Submit an Oversight request (max 2 every "
+        "- `/oversight <text>` – Submit an Oversight request (max 2 every "
         "{cooldown}s; *Oversighters & bot-admins exempt*)\n"
-        "• `/claim [ID]` – Claim one request or **every** pending request if no ID\n"
-        "• `/view <ID>` – View any request by ID (Oversighters only)\n"
-        "• `/pending` – List unclaimed request IDs (Oversighters only)\n"
-        "• `!OversightBot ping on|off` – Opt‑in/out of pings for new requests "
+        "- `/claim [ID]` – Claim one request or **every** pending request if no ID\n"
+        "- `/view <ID>` – View any request by ID (Oversighters only)\n"
+        "- `/pending` – List unclaimed request IDs (Oversighters only)\n"
+        "- `!OversightBot ping on|off` – Opt‑in/out of pings for new requests "
         "(Oversighters only)\n"
-        "• `!OversightBot addos @u` / `removeos @u` – Manage Oversighters "
+        "- `!OversightBot addos @u` / `removeos @u` – Manage Oversighters "
         "(bot admins only)\n"
-        "• `!OversightBot help` – Show this help\n"
+        "- `!OversightBot help` – Show this help\n"
     ),
     "usage_addos": "Usage: `!OversightBot addos @user`",
     "usage_removeos": "Usage: `!OversightBot removeos @user`",
@@ -243,17 +243,11 @@ async def remove_oversighter(user_id: int) -> None:
 async def notify_restricted(
     bot: commands.Bot,
     content: str,
-    ping_new: bool = False,
 ) -> None:
-    """Send a message to the restricted channel, optionally pinging opted-in 
-    Oversighters."""
+    """Send a message to the restricted channel."""
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
     if not chan:
         return
-    if ping_new:
-        subs = await get_ping_subs()
-        if subs:
-            content += " " + " ".join(f"<@{uid}>" for uid in subs)
     await chan.send(content)
 
 # =========================== Database Layer ==============================
@@ -276,6 +270,15 @@ async def init_db() -> None:
                    )"""
             )
             await db.commit()
+            
+            # Add message_id column for tracking Discord messages (harmless if already exists)
+            try:
+                await db.execute("ALTER TABLE requests ADD COLUMN message_id INTEGER")
+                await db.commit()
+            except sqlite3.OperationalError:
+                # column already present – ignore
+                pass
+            
             # Table for Oversighters who opt in to pings on new requests
             await db.execute(
                 "CREATE TABLE IF NOT EXISTS ping_subscribers ("
@@ -469,12 +472,28 @@ async def oversight(interaction: discord.Interaction, request_text: str):
         ephemeral=True,
     )
 
-    # Notify Oversighters in the restricted channel, pinging opted-in users
-    await notify_restricted(
-        bot,
-        RESTRICTED["new_request"].format(ticket_id=ticket_id, user_mention=interaction.user.mention),
-        ping_new=True,
+    # Post the request and remember its message-ID
+    status_line = "🔴 Unclaimed"
+    content = RESTRICTED["request"].format(
+        ticket_id=ticket_id,
+        status=status_line,
+        user_mention=interaction.user.mention,
     )
+
+    chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
+    # include optional pings
+    if (subs := await get_ping_subs()):
+        content += " " + " ".join(f"<@{uid}>" for uid in subs)
+
+    msg = await chan.send(content)          # <-- ACTUAL POST
+    # remember the message id so we can edit it later
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE requests SET message_id = ? WHERE id = ?",
+            (msg.id, ext_id_to_row(ticket_id)),
+        )
+        await db.commit()
+    
     logger.info("Request %s submitted by %s", ticket_id, interaction.user)
 
 @bot.tree.command(
@@ -526,7 +545,7 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
                 text=req["text"],
                 author_id=req["author_id"],
             )
-            + f"\n\n{SUCCESS['follow_up_note']}",
+            + f"{SUCCESS['follow_up_note']}",
             ephemeral=True,
         )
 
@@ -543,14 +562,21 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
             except discord.HTTPException:
                 pass
 
-        # Announce in restricted channel only for newly-claimed requests
-        await notify_restricted(
-            bot,
-            RESTRICTED["request_claimed"].format(
-                request_id=row_to_ext_id(_row_id),
-                claimer=interaction.user.mention,
-            ),
-        )
+        # Edit the status when a request is claimed
+        msg_id = req["message_id"]
+        if msg_id:
+            chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
+            try:
+                msg = await chan.fetch_message(msg_id)
+                new_content = RESTRICTED["request"].format(
+                    ticket_id=row_to_ext_id(_row_id),
+                    status=f"✅ Claimed by {interaction.user.mention}",
+                    user_mention=f"<@{req['author_id']}>",
+                )
+                await msg.edit(content=new_content)
+            except discord.NotFound:
+                # fall back silently if the original message vanished
+                pass
 
     # Defer the response to avoid race conditions
     await interaction.response.defer(ephemeral=True)
