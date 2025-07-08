@@ -292,7 +292,11 @@ class RequestView(View):
 
         # ---- CLAIM BUTTON --------------------------------------------------
         async def _claim_cb(inter: discord.Interaction):
-            if not await is_oversighter(inter.user.id):
+            # Role‑based oversighter (fast‑path)
+            if OVERSIGHT_ROLE_ID and any(r.id == OVERSIGHT_ROLE_ID for r in inter.user.roles):
+                pass
+            # Fallback to DB‑listed oversighters
+            elif not await is_oversighter(inter.user.id):
                 await inter.response.send_message(ERRORS["not_oversighter"], ephemeral=True)
                 return
 
@@ -328,7 +332,11 @@ class RequestView(View):
 
         # ---- RESPOND BUTTON ------------------------------------------------
         async def _respond_cb(inter: discord.Interaction):
-            if not await is_oversighter(inter.user.id):
+            # Role‑based oversighter (fast‑path)
+            if OVERSIGHT_ROLE_ID and any(r.id == OVERSIGHT_ROLE_ID for r in inter.user.roles):
+                pass
+            # Fallback to DB‑listed oversighters
+            elif not await is_oversighter(inter.user.id):
                 await inter.response.send_message(ERRORS["not_oversighter"], ephemeral=True)
                 return
             await inter.response.send_modal(RespondModal(self.ext_id))
