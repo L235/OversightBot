@@ -208,6 +208,104 @@ def row_to_ext_id(rowid: int) -> int:
     """Convert internal DB rowid to external ticket ID."""
     return rowid + ID_OFFSET
 
+async def has_oversight_perm(member: discord.abc.User) -> bool:
+    """True if *member* is an Oversighter (role-based or DB-listed)."""
+    if OVERSIGHT_ROLE_ID and getattr(member, "roles", None):
+        if any(r.id == OVERSIGHT_ROLE_ID for r in member.roles):
+            return True
+    return await is_oversighter(member.id)
+
+async def _claim_ticket(
+    bot: commands.Bot,
+    ext_id: int,
+    claimer: discord.Member,
+    *,
+    interaction: Optional[discord.Interaction] = None,
+    view: Optional[discord.ui.View] = None,
+) -> bool:
+    """
+    Shared claim implementation used by **/claim** *and* the Claim button.
+
+    • Performs the atomic DB claim.
+    • Notifies the original submitter once.
+    • Updates the restricted-channel message and removes the Claim button.
+    • If *interaction* is supplied, sends an ephemeral acknowledgement/error.
+    Returns ``True`` only on a *new* successful claim.
+    """
+
+    # Helper for safe ephemeral replies (works before/after defer())
+    async def _ephemeral(msg: str) -> None:
+        """
+        Reply ephemerally whether or not the interaction was already deferred.
+        """
+        if interaction is None:
+            return
+
+        if interaction.response.is_done():
+            # response already sent or deferred → use follow-up
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            # first-time reply
+            await interaction.response.send_message(msg, ephemeral=True)
+
+    try:
+        row_id = ext_id_to_row(ext_id)
+    except ValueError:
+        await _ephemeral(ERRORS["invalid_id"])
+        return False
+
+    req = await fetch_request(row_id)
+    if not req:
+        await _ephemeral(ERRORS["unknown_request_id"])
+        return False
+
+    claimed_now = False
+    if not req["claimed_by"]:
+        claimed_now = await claim_request(row_id, claimer.id)
+
+    if not claimed_now and req["claimed_by"] != claimer.id:
+        claimant = await bot.fetch_user(req["claimed_by"])
+        await _ephemeral(ERRORS["already_claimed"].format(claimant=claimant.mention))
+        return False
+
+    # ─── Notify submitter (once) ──────────────────────────────────────────
+    if claimed_now and req["author_id"]:
+        try:
+            author = await bot.fetch_user(req["author_id"])
+            await author.send(
+                INFO["request_claimed_notification"].format(
+                    request_id=ext_id,
+                    claimer=claimer.mention,
+                )
+            )
+        except discord.HTTPException:
+            pass
+
+    # ─── Update restricted-channel message & remove button ───────────────
+    if req["message_id"]:
+        chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
+        try:
+            msg = await chan.fetch_message(req["message_id"])
+            new_content = RESTRICTED["request"].format(
+                ticket_id=ext_id,
+                status=f"✅ Claimed by {claimer.mention}",
+                user_mention=f"<@{req['author_id']}>",
+                request_text=req["text"],
+            )
+            if view:                           # button path – edit in-place
+                for child in list(view.children):
+                    if isinstance(child, Button) and child.custom_id.startswith("claim_"):
+                        view.remove_item(child)
+                await msg.edit(content=new_content, view=view)
+            else:                              # /claim path – just strip view
+                await msg.edit(content=new_content, view=None)
+        except discord.NotFound:
+            pass
+
+    await _ephemeral(f"Request #{ext_id} claimed. {SUCCESS['follow_up_note']}")
+    return claimed_now
+
+
 # ---------------------------------------------------------------------------
 #  🔧  COMMON HELPER FOR SENDING OVERSIGHT RESPONSES
 # ---------------------------------------------------------------------------
@@ -292,35 +390,16 @@ class RequestView(View):
 
         # ---- CLAIM BUTTON --------------------------------------------------
         async def _claim_cb(inter: discord.Interaction):
-            # Role‑based oversighter (fast‑path)
-            if OVERSIGHT_ROLE_ID and any(r.id == OVERSIGHT_ROLE_ID for r in inter.user.roles):
-                pass
-            # Fallback to DB‑listed oversighters
-            elif not await is_oversighter(inter.user.id):
+            if not await has_oversight_perm(inter.user):
                 await inter.response.send_message(ERRORS["not_oversighter"], ephemeral=True)
                 return
-
-            # Same effect as /claim <id>
-            if not await claim_request(ext_id_to_row(self.ext_id), inter.user.id):
-                await inter.response.send_message(
-                    ERRORS["already_claimed"].format(claimant="someone"),
-                    ephemeral=True,
-                )
-                return
-
-            await inter.response.send_message(
-                f"Request #{self.ext_id} claimed. {SUCCESS['follow_up_note']}",
-                ephemeral=True,
+            await _claim_ticket(
+                bot,
+                self.ext_id,
+                inter.user,
+                interaction=inter,
+                view=self,
             )
-
-            # Update the visible status line & remove the Claim button
-            if self.message:
-                new_content = self.message.content.replace(
-                    "🔴 Unclaimed",
-                    f"✅ Claimed by {inter.user.mention}",
-                )
-                self.remove_item(self.children[0])  # remove Claim button
-                await self.message.edit(content=new_content, view=self)
 
         claim_btn = Button(
             label="Claim",
@@ -332,11 +411,7 @@ class RequestView(View):
 
         # ---- RESPOND BUTTON ------------------------------------------------
         async def _respond_cb(inter: discord.Interaction):
-            # Role‑based oversighter (fast‑path)
-            if OVERSIGHT_ROLE_ID and any(r.id == OVERSIGHT_ROLE_ID for r in inter.user.roles):
-                pass
-            # Fallback to DB‑listed oversighters
-            elif not await is_oversighter(inter.user.id):
+            if not await has_oversight_perm(inter.user):
                 await inter.response.send_message(ERRORS["not_oversighter"], ephemeral=True)
                 return
             await inter.response.send_modal(RespondModal(self.ext_id))
@@ -365,11 +440,7 @@ def oversighter_check():
     """Decorator that checks current Oversighter status (DB **or role**)."""
 
     async def predicate(interaction: discord.Interaction) -> bool:
-        # Role‑based oversighter (fast‑path)
-        if OVERSIGHT_ROLE_ID and any(r.id == OVERSIGHT_ROLE_ID for r in interaction.user.roles):
-            return True
-        # Fallback to DB‑listed oversighters
-        if await is_oversighter(interaction.user.id):
+        if await has_oversight_perm(interaction.user):
             return True
         raise app_commands.CheckFailure(ERRORS["not_oversighter"])
 
@@ -688,65 +759,12 @@ async def oversight(interaction: discord.Interaction, request_text: str):
 async def claim(interaction: discord.Interaction, request_id: Optional[int] = None):
     # Helper that actually performs the single-request claim flow
     async def _claim_one(_row_id: int, first: bool):
-        req = await fetch_request(_row_id)
-        if not req:
-            if first:
-                await interaction.followup.send(ERRORS["unknown_request_id"], ephemeral=True)
-            return
-
-        # Try to claim atomically
-        success = False
-        if not req["claimed_by"]:
-            success = await claim_request(_row_id, interaction.user.id)
-            if success:
-                req = await fetch_request(_row_id)  # refresh with claimer info
-
-        # ----- If already claimed (by anyone), show details like /view -----
-        if req["claimed_by"] and not success:
-            claimant = await bot.fetch_user(req["claimed_by"])
-            if first:
-                await interaction.followup.send(
-                    ERRORS["already_claimed"].format(claimant=claimant.mention),
-                    ephemeral=True,
-                )
-            return
-
-        # ----- Newly claimed by the caller -----
-        await interaction.followup.send(
-            f"Request #{row_to_ext_id(_row_id)} claimed. "
-            + f"{SUCCESS['follow_up_note']}",
-            ephemeral=True,
+        await _claim_ticket(
+            bot,
+            row_to_ext_id(_row_id),
+            interaction.user,
+            interaction=interaction,
         )
-
-        # Notify author only on *new* claim
-        if req["author_id"]:
-            try:
-                user = await bot.fetch_user(req["author_id"])
-                await user.send(
-                    INFO["request_claimed_notification"].format(
-                        request_id=row_to_ext_id(_row_id),
-                        claimer=interaction.user.mention,
-                    )
-                )
-            except discord.HTTPException:
-                pass
-
-        # Edit the status when a request is claimed
-        msg_id = req["message_id"]
-        if msg_id:
-            chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
-            try:
-                msg = await chan.fetch_message(msg_id)
-                new_content = RESTRICTED["request"].format(
-                    ticket_id=row_to_ext_id(_row_id),
-                    status=f"✅ Claimed by {interaction.user.mention}",
-                    user_mention=f"<@{req['author_id']}>",
-                    request_text=req["text"],
-                )
-                await msg.edit(content=new_content)
-            except discord.NotFound:
-                # fall back silently if the original message vanished
-                pass
 
     # Defer the response to avoid race conditions
     await interaction.response.defer(ephemeral=True)
@@ -865,10 +883,7 @@ async def on_message(message: discord.Message):
         return
 
     # Only Oversighters may toggle pings
-    if not (
-        await is_oversighter(message.author.id)
-        or (OVERSIGHT_ROLE_ID and OVERSIGHT_ROLE_ID in {r.id for r in getattr(message.author, "roles", [])})
-    ):
+    if not await has_oversight_perm(message.author):
         await message.reply(
             ERRORS["only_oversighters_ping"],
             mention_author=False,
