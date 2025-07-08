@@ -45,7 +45,7 @@ ERRORS = {
     "rate_limit_exceeded": "⏳ Rate limit exceeded – max 2 requests every {cooldown}s.",
     "unknown_request_id": "⚠️ Unknown request ID.",
     "invalid_id": "⚠️ Invalid ID.",
-    "already_claimed": "Already claimed by {claimant}. Showing details below instead.",
+    "already_claimed": "Already claimed by {claimant}.",
     "not_oversighter": "You are not configured as an Oversighter.",
     "not_bot_admin": "You are not a bot admin.",
     "only_bot_admins_add": "Only bot admins may add Oversighters.",
@@ -80,11 +80,11 @@ SUCCESS = {
 INFO = {
     "request_claimed_notification": (
         "Your Oversight request #{request_id} was "
-        "claimed by Oversighter {claimer}."
+        "viewed by Oversighter {claimer}."
     ),
     "reminder_message": (
         "Your Oversight request #{request_id} has not been claimed "
-        "by an Oversighterwithin {minutes} minutes.\n\n"
+        "by an Oversighter within {minutes} minutes.\n\n"
         "**Your original request:**\n> {request_text}\n\n"
         "Please consider submitting the request through other channels "
         "by following the instructions at "
@@ -109,6 +109,7 @@ RESTRICTED = {
         "- ID: #{ticket_id}\n"
         "- Status: {status}\n"
         "- From: {user_mention}\n"
+        "- Text:\n> {request_text}\n\n"
         "Oversighters may claim all pending requests with `/claim`."
     ),
     "request_viewed": "{viewer} viewed {status} request #{request_id}.",
@@ -125,7 +126,6 @@ HELP = {
         "- `/oversight <text>` – Submit an Oversight request (max 2 every "
         "{cooldown}s; *Oversighters & bot-admins exempt*)\n"
         "- `/claim [ID]` – Claim one request or **every** pending request if no ID\n"
-        "- `/view <ID>` – View any request by ID (Oversighters only)\n"
         "- `/pending` – List unclaimed request IDs (Oversighters only)\n"
         "- `!OversightBot ping on|off` – Opt‑in/out of pings for new requests "
         "(Oversighters only)\n"
@@ -141,8 +141,27 @@ HELP = {
 # =========================== Configuration ============================
 
 TOKEN: str = os.environ["DISCORD_TOKEN"]
-GUILD_ID: int = int(os.environ["GUILD_ID"])
+
+# ────────────────────────────────────────────────────────────────
+# Dual‑guild deployment
+#   SUBMISSION_GUILD_ID – guild/server where users invoke /oversight
+#   CLAIM_GUILD_ID      – guild/server that hosts the restricted
+#                         channel and where Oversighters process
+#                         requests with /claim, /pending, etc.
+# ────────────────────────────────────────────────────────────────
+SUBMISSION_GUILD_ID: int = int(os.environ["SUBMISSION_GUILD_ID"])
+CLAIM_GUILD_ID: int = int(os.environ["CLAIM_GUILD_ID"])
+
+# Restricted channel now lives on the *CLAIM* guild (different
+# from where /oversight is run) – channel IDs are still globally
+# unique so only its ID is required here.
 RESTRICTED_CHANNEL_ID: int = int(os.environ["RESTRICTED_CHANNEL_ID"])
+
+# Optional Discord role that automatically grants Oversighter
+# privileges (in addition to DB‑listed Oversighters)
+OVERSIGHT_ROLE_ID: Optional[int] = (
+    int(os.getenv("OVERSIGHT_ROLE_ID")) if os.getenv("OVERSIGHT_ROLE_ID") else None
+)
 
 # ---------------------------------------------------------------------
 # IDs provided via ENV are now **bot-admins** only.  Oversighters live
@@ -199,14 +218,16 @@ async def is_oversighter(user_id: int) -> bool:
 
 
 def oversighter_check():
-    """Decorator that checks current Oversighter status (DB-backed)."""
+    """Decorator that checks current Oversighter status (DB **or role**)."""
 
     async def predicate(interaction: discord.Interaction) -> bool:
-        if not await is_oversighter(interaction.user.id):
-            raise app_commands.CheckFailure(
-                ERRORS["not_oversighter"]
-            )
-        return True
+        # Role‑based oversighter (fast‑path)
+        if OVERSIGHT_ROLE_ID and any(r.id == OVERSIGHT_ROLE_ID for r in interaction.user.roles):
+            return True
+        # Fallback to DB‑listed oversighters
+        if await is_oversighter(interaction.user.id):
+            return True
+        raise app_commands.CheckFailure(ERRORS["not_oversighter"])
 
     return app_commands.check(predicate)
 
@@ -436,17 +457,20 @@ class OversightBot(commands.Bot):
         await init_db()
         # kick off reminder loop
         self.reminder_task = asyncio.create_task(reminder_loop(self))
-        await self.tree.sync(guild=GUILD_OBJ)
+        # Sync commands to *both* guilds (they host different command sets)
+        await self.tree.sync(guild=SUBMISSION_GUILD_OBJ)
+        await self.tree.sync(guild=CLAIM_GUILD_OBJ)
 
 bot = OversightBot(command_prefix="!", intents=intents)
-GUILD_OBJ = discord.Object(id=GUILD_ID)
+SUBMISSION_GUILD_OBJ = discord.Object(id=SUBMISSION_GUILD_ID)
+CLAIM_GUILD_OBJ = discord.Object(id=CLAIM_GUILD_ID)
 
 # ========================= Slash Command Handlers =========================
 
 @bot.tree.command(
     name="oversight",
     description="Submit a Wikipedia Oversight request",
-    guild=GUILD_OBJ,
+    guild=SUBMISSION_GUILD_OBJ,
 )
 @app_commands.describe(request_text="Describe what needs to be oversighted.")
 async def oversight(interaction: discord.Interaction, request_text: str):
@@ -478,6 +502,7 @@ async def oversight(interaction: discord.Interaction, request_text: str):
         ticket_id=ticket_id,
         status=status_line,
         user_mention=interaction.user.mention,
+        request_text=request_text,
     )
 
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
@@ -499,7 +524,7 @@ async def oversight(interaction: discord.Interaction, request_text: str):
 @bot.tree.command(
     name="claim",
     description="Claim and receive an Oversight request",
-    guild=GUILD_OBJ,
+    guild=CLAIM_GUILD_OBJ,
 )
 @oversighter_check()
 @app_commands.describe(request_id="Ticket ID.  Omit to claim *all* unclaimed.")
@@ -528,23 +553,11 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
                     ERRORS["already_claimed"].format(claimant=claimant.mention),
                     ephemeral=True,
                 )
-            await interaction.followup.send(
-                INFO["view_request_details"].format(
-                    request_id=row_to_ext_id(_row_id),
-                    text=req["text"],
-                    author_id=req["author_id"],
-                ),
-                ephemeral=True,
-            )
             return
 
         # ----- Newly claimed by the caller -----
         await interaction.followup.send(
-            INFO["request_details"].format(
-                request_id=row_to_ext_id(_row_id),
-                text=req["text"],
-                author_id=req["author_id"],
-            )
+            f"Request #{row_to_ext_id(_row_id)} claimed. "
             + f"{SUCCESS['follow_up_note']}",
             ephemeral=True,
         )
@@ -572,6 +585,7 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
                     ticket_id=row_to_ext_id(_row_id),
                     status=f"✅ Claimed by {interaction.user.mention}",
                     user_mention=f"<@{req['author_id']}>",
+                    request_text=req["text"],
                 )
                 await msg.edit(content=new_content)
             except discord.NotFound:
@@ -603,59 +617,13 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
     for idx, ext_id in enumerate(pending, start=1):
         await _claim_one(ext_id_to_row(ext_id), idx == 1)
 
-@bot.tree.command(
-    name="view",
-    description="View an already‐claimed Oversight request",
-    guild=GUILD_OBJ,
-)
-@oversighter_check()
-@app_commands.describe(request_id="Numeric ticket ID.  Omit to view *all* unclaimed.")
-async def view(interaction: discord.Interaction, request_id: Optional[int] = None):
-    await interaction.response.defer(ephemeral=True)
-    # ---------- View ALL unclaimed if no ID ----------
-    if request_id is None:
-        pending = await list_pending()
-        if not pending:
-            await interaction.followup.send(SUCCESS["no_unclaimed"], ephemeral=True)
-            return
-        for ext_id in pending:
-            req = await fetch_request(ext_id_to_row(ext_id))
-            await interaction.followup.send(
-                INFO["view_request_details"].format(
-                    request_id=ext_id,
-                    text=req["text"],
-                    author_id=req["author_id"],
-                ),
-                ephemeral=True,
-            )
-        return
-
-    # ---------- View single ID ----------
-    try:
-        row_id = ext_id_to_row(request_id)
-    except ValueError:
-        await interaction.followup.send(ERRORS["invalid_id"], ephemeral=True)
-        return
-
-    req = await fetch_request(row_id)
-    if not req:
-        await interaction.followup.send(ERRORS["unknown_request_id"], ephemeral=True)
-        return
-
-    await interaction.followup.send(
-        INFO["view_request_details"].format(
-            request_id=request_id,
-            text=req["text"],
-            author_id=req["author_id"],
-        ),
-        ephemeral=True,
-    )
-    # No channel notification for /view (requirement 4)
+# /view command removed – full request text is always available in the restricted
+# channel, making a separate viewer unnecessary.
 
 @bot.tree.command(
     name="pending",
     description="List all unclaimed Oversight request IDs",
-    guild=GUILD_OBJ,
+    guild=CLAIM_GUILD_OBJ,
 )
 @oversighter_check()
 async def pending(interaction: discord.Interaction):
@@ -721,7 +689,10 @@ async def on_message(message: discord.Message):
         return
 
     # Only Oversighters may toggle pings
-    if not await is_oversighter(message.author.id):
+    if not (
+        await is_oversighter(message.author.id)
+        or (OVERSIGHT_ROLE_ID and OVERSIGHT_ROLE_ID in {r.id for r in getattr(message.author, "roles", [])})
+    ):
         await message.reply(
             ERRORS["only_oversighters_ping"],
             mention_author=False,
@@ -755,7 +726,6 @@ async def on_message(message: discord.Message):
 # ========================= Error Handling and Startup =========================
 
 @claim.error
-@view.error
 @pending.error
 async def oversight_error(interaction: discord.Interaction, error):
     # Handle permission errors and log unexpected exceptions
@@ -769,6 +739,6 @@ async def oversight_error(interaction: discord.Interaction, error):
 async def on_ready():
     # Log successful bot startup
     logger.info("Logged in as %s (%s)", bot.user, bot.user.id)
-    logger.info("Commands synced to guild %s", GUILD_ID)
+    logger.info("Commands synced to guilds %s (submit) and %s (claim)", SUBMISSION_GUILD_ID, CLAIM_GUILD_ID)
 
 bot.run(TOKEN)
