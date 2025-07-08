@@ -159,11 +159,22 @@ CLAIM_GUILD_ID: int = int(os.environ["CLAIM_GUILD_ID"])
 # unique so only its ID is required here.
 RESTRICTED_CHANNEL_ID: int = int(os.environ["RESTRICTED_CHANNEL_ID"])
 
-# Optional Discord role that automatically grants Oversighter
-# privileges (in addition to DB‑listed Oversighters)
-OVERSIGHT_ROLE_ID: Optional[int] = (
-    int(os.getenv("OVERSIGHT_ROLE_ID")) if os.getenv("OVERSIGHT_ROLE_ID") else None
-)
+# ---------------------------------------------------------------------
+# Helper to allow single-value or comma-separated lists for role IDs
+# ---------------------------------------------------------------------
+def _parse_id_set(env_var: str) -> Optional[Set[int]]:
+    """
+    Return a **set[int]** parsed from the comma-separated ENV *env_var*.
+    Empty or unset → ``None`` (disabled).
+    """
+    raw = os.getenv(env_var, "")
+    ids = {int(tok) for tok in raw.split(",") if tok.strip()}
+    return ids or None
+
+# Optional Discord role(s) that automatically grant Oversighter
+# privileges (in addition to DB-listed Oversighters).  Accepts either
+# a single ID or a comma-separated list.
+OVERSIGHT_ROLE_ID: Optional[Set[int]] = _parse_id_set("OVERSIGHT_ROLE_ID")
 
 # ---------------------------------------------------------------------
 # IDs provided via ENV are now **bot-admins** only.  Oversighters live
@@ -173,10 +184,9 @@ BOT_ADMINS: Set[int] = {
     int(x.strip()) for x in os.getenv("BOT_ADMINS", "").split(",") if x.strip()
 }
 
-# Optional role required to submit oversight requests
-SUBMITTER_ROLE_ID: Optional[int] = (
-    int(os.getenv("SUBMITTER_ROLE_ID")) if os.getenv("SUBMITTER_ROLE_ID") else None
-)
+# Optional role(s) required to submit oversight requests.  Accepts a
+# single ID or a comma-separated list.
+SUBMITTER_ROLE_ID: Optional[Set[int]] = _parse_id_set("SUBMITTER_ROLE_ID")
 
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "600"))
 DB_PATH: str = os.getenv("DB_PATH", "./oversight.sqlite")
@@ -211,7 +221,7 @@ def row_to_ext_id(rowid: int) -> int:
 async def has_oversight_perm(member: discord.abc.User) -> bool:
     """True if *member* is an Oversighter (role-based or DB-listed)."""
     if OVERSIGHT_ROLE_ID and getattr(member, "roles", None):
-        if any(r.id == OVERSIGHT_ROLE_ID for r in member.roles):
+        if any(role.id in OVERSIGHT_ROLE_ID for role in member.roles):
             return True
     return await is_oversighter(member.id)
 
@@ -698,9 +708,9 @@ CLAIM_GUILD_OBJ = discord.Object(id=CLAIM_GUILD_ID)
 )
 @app_commands.describe(request_text="Describe what needs to be oversighted.")
 async def oversight(interaction: discord.Interaction, request_text: str):
-    # Optionally restrict submission to users with a specific role
+    # Optionally restrict submission to users with specific role(s)
     if SUBMITTER_ROLE_ID:
-        if SUBMITTER_ROLE_ID not in {role.id for role in interaction.user.roles}:
+        if not any(role.id in SUBMITTER_ROLE_ID for role in interaction.user.roles):
             await interaction.response.send_message(
                 ERRORS["not_authenticated"],
                 ephemeral=True,
