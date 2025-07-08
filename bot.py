@@ -31,6 +31,7 @@ from typing import List, Tuple, Optional, Set
 import aiosqlite
 import discord
 from discord import app_commands
+from discord.ui import Button, View, Modal, TextInput
 from discord.ext import commands
 
 # =========================== User Interface Messages ============================
@@ -126,6 +127,7 @@ HELP = {
         "- `/oversight <text>` – Submit an Oversight request (max 2 every "
         "{cooldown}s; *Oversighters & bot-admins exempt*)\n"
         "- `/claim [ID]` – Claim one request or **every** pending request if no ID\n"
+        "- `/respond <ID> <text>` – Send a response to a request (Oversighters only)\n"
         "- `/pending` – List unclaimed request IDs (Oversighters only)\n"
         "- `!OversightBot ping on|off` – Opt‑in/out of pings for new requests "
         "(Oversighters only)\n"
@@ -191,7 +193,7 @@ logging.basicConfig(
 logger = logging.getLogger("oversight-bot")
 
 # External ticket IDs start at some offset (currently 0) for user-facing clarity
-ID_OFFSET = 0
+ID_OFFSET = 1000
 
 # ===================== Utility and Permission Helpers =====================
 
@@ -205,6 +207,140 @@ def ext_id_to_row(ext_id: int) -> int:
 def row_to_ext_id(rowid: int) -> int:
     """Convert internal DB rowid to external ticket ID."""
     return rowid + ID_OFFSET
+
+# ---------------------------------------------------------------------------
+#  🔧  COMMON HELPER FOR SENDING OVERSIGHT RESPONSES
+# ---------------------------------------------------------------------------
+async def _send_oversight_response(
+    interaction: discord.Interaction,
+    ext_id: int,
+    response_text: str,
+) -> None:
+    """DM the requester and copy the response to the restricted channel."""
+    try:
+        row_id = ext_id_to_row(ext_id)
+    except ValueError:
+        await interaction.response.send_message(ERRORS["invalid_id"], ephemeral=True)
+        return
+
+    req = await fetch_request(row_id)
+    if not req:
+        await interaction.response.send_message(ERRORS["unknown_request_id"], ephemeral=True)
+        return
+
+    # -------- DM the original submitter ------------------------------------
+    try:
+        user = await bot.fetch_user(req["author_id"])
+        await user.send(f"Response from the oversight team on Oversight request #{ext_id}: {response_text}")
+    except discord.HTTPException:
+        pass
+
+    # --- link to the original request message -----------------------------
+    if req["message_id"]:
+        req_url = (
+            f"https://discord.com/channels/"
+            f"{CLAIM_GUILD_ID}/{RESTRICTED_CHANNEL_ID}/{req['message_id']}"
+        )
+        req_ref = f"[request #{ext_id}]({req_url})"
+    else:
+        req_ref = f"request #{ext_id}"
+
+    await notify_restricted(
+        bot,
+        f"Oversighter {interaction.user.mention} responded to {req_ref} "
+        f"with the following:\n> {response_text}",
+    )
+
+    await interaction.response.send_message("✅ Response sent.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+#  🔧  UI – Buttons & Modal attached to each request message
+# ---------------------------------------------------------------------------
+
+class RespondModal(Modal, title="Respond to request"):
+    """Modal shown after the **Respond** button is clicked."""
+
+    def __init__(self, ext_id: int):
+        super().__init__(timeout=180, title=f"Respond to request #{ext_id}")
+        self.ext_id = ext_id
+
+        # One multiline textbox
+        self.response: TextInput = TextInput(
+            label="Response",
+            placeholder="Enter your response…",
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.response)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Called when the modal is submitted."""
+        await _send_oversight_response(
+            interaction,
+            self.ext_id,
+            self.response.value,
+        )
+
+
+class RequestView(View):
+    """Interactive view added to every freshly-posted request."""
+
+    def __init__(self, ext_id: int):
+        super().__init__(timeout=None)
+        self.ext_id = ext_id
+        self.message: Optional[discord.Message] = None  # filled in after send
+
+        # ---- CLAIM BUTTON --------------------------------------------------
+        async def _claim_cb(inter: discord.Interaction):
+            if not await is_oversighter(inter.user.id):
+                await inter.response.send_message(ERRORS["not_oversighter"], ephemeral=True)
+                return
+
+            # Same effect as /claim <id>
+            if not await claim_request(ext_id_to_row(self.ext_id), inter.user.id):
+                await inter.response.send_message(
+                    ERRORS["already_claimed"].format(claimant="someone"),
+                    ephemeral=True,
+                )
+                return
+
+            await inter.response.send_message(
+                f"Request #{self.ext_id} claimed. {SUCCESS['follow_up_note']}",
+                ephemeral=True,
+            )
+
+            # Update the visible status line & remove the Claim button
+            if self.message:
+                new_content = self.message.content.replace(
+                    "🔴 Unclaimed",
+                    f"✅ Claimed by {inter.user.mention}",
+                )
+                self.remove_item(self.children[0])  # remove Claim button
+                await self.message.edit(content=new_content, view=self)
+
+        claim_btn = Button(
+            label="Claim",
+            style=discord.ButtonStyle.success,
+            custom_id=f"claim_{ext_id}",
+        )
+        claim_btn.callback = _claim_cb
+        self.add_item(claim_btn)
+
+        # ---- RESPOND BUTTON ------------------------------------------------
+        async def _respond_cb(inter: discord.Interaction):
+            if not await is_oversighter(inter.user.id):
+                await inter.response.send_message(ERRORS["not_oversighter"], ephemeral=True)
+                return
+            await inter.response.send_modal(RespondModal(self.ext_id))
+
+        respond_btn = Button(
+            label="Respond",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"respond_{ext_id}",
+        )
+        respond_btn.callback = _respond_cb
+        self.add_item(respond_btn)
+
 
 # ===================  Oversighter & Admin helpers  ====================
 
@@ -404,8 +540,9 @@ async def reminder_loop(bot: commands.Bot):
         cutoff_ts = int(datetime.utcnow().timestamp()) - REMINDER_MINUTES * 60
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = sqlite3.Row
+            # include message_id so we can build a link
             cur = await db.execute(
-                "SELECT id, author_id, text FROM requests "
+                "SELECT id, author_id, text, message_id FROM requests "
                 "WHERE claimed_by IS NULL "
                 "  AND created_at < ? "
                 "  AND (reminded_at IS NULL)",
@@ -415,6 +552,17 @@ async def reminder_loop(bot: commands.Bot):
 
             for row in rows:
                 ext_id = row_to_ext_id(row["id"])
+
+                # Build a markdown link to the original request, if known
+                if row["message_id"]:
+                    req_url = (
+                        f"https://discord.com/channels/"
+                        f"{CLAIM_GUILD_ID}/{RESTRICTED_CHANNEL_ID}/{row['message_id']}"
+                    )
+                    req_ref = f"[request #{ext_id}]({req_url})"
+                else:
+                    req_ref = f"request #{ext_id}"
+
                 author = await bot.fetch_user(row["author_id"])
                 request_text = row["text"]
                 msg = INFO["reminder_message"].format(
@@ -429,11 +577,8 @@ async def reminder_loop(bot: commands.Bot):
 
                 await notify_restricted(
                     bot,
-                    RESTRICTED["reminder_sent"].format(
-                        user_mention=author.mention,
-                        request_id=ext_id,
-                        minutes=REMINDER_MINUTES
-                    ),
+                    f"Sent unclaimed-request notice to {author.mention} for "
+                    f"{req_ref} (>{REMINDER_MINUTES} min old).",
                 )
 
                 now_ts = int(datetime.utcnow().timestamp())
@@ -510,7 +655,10 @@ async def oversight(interaction: discord.Interaction, request_text: str):
     if (subs := await get_ping_subs()):
         content += " " + " ".join(f"<@{uid}>" for uid in subs)
 
-    msg = await chan.send(content)          # <-- ACTUAL POST
+    # Attach buttons
+    view = RequestView(ticket_id)
+    msg = await chan.send(content, view=view)  # POST with interactive buttons
+    view.message = msg                        # store for later edits
     # remember the message id so we can edit it later
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -616,6 +764,26 @@ async def claim(interaction: discord.Interaction, request_id: Optional[int] = No
     )
     for idx, ext_id in enumerate(pending, start=1):
         await _claim_one(ext_id_to_row(ext_id), idx == 1)
+
+# ---------------------------------------------------------------------------
+#  /respond – Send a response to the requester (claim guild only)
+# ---------------------------------------------------------------------------
+@bot.tree.command(
+    name="respond",
+    description="Send a response to an Oversight request",
+    guild=CLAIM_GUILD_OBJ,
+)
+@oversighter_check()
+@app_commands.describe(
+    request_id="Ticket ID you are responding to",
+    response_text="Your response text",
+)
+async def respond(
+    interaction: discord.Interaction,
+    request_id: int,
+    response_text: str,
+):
+    await _send_oversight_response(interaction, request_id, response_text)
 
 # /view command removed – full request text is always available in the restricted
 # channel, making a separate viewer unnecessary.
