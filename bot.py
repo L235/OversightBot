@@ -40,6 +40,7 @@ from discord import app_commands
 from discord.ui import View, Button, Modal, TextInput
 from discord.ext import commands
 import re
+from discord import MessageType
 
 # Configuration
 TOKEN                    = os.environ["DISCORD_TOKEN"]
@@ -199,10 +200,14 @@ def _replace_status_block(lines: List[str], fresh: str) -> List[str]:
         cleaned.insert(1, fresh)
     return cleaned
 
-async def _first_message(thread: discord.Thread) -> Optional[discord.Message]:
-    """Return the very first message in a thread (oldest_first history)."""
-    async for m in thread.history(limit=1, oldest_first=True):
-        return m
+async def _thread_header(thread: discord.Thread, bot: commands.Bot) -> Optional[discord.Message]:
+    """
+    Return the first **regular** (non‑system) message in the thread that was
+    authored by *this* bot.  That is the header we want to keep updating.
+    """
+    async for m in thread.history(limit=20, oldest_first=True):
+        if m.type is MessageType.default and m.author.id == bot.user.id:
+            return m
     return None
 
 async def update_status(
@@ -223,6 +228,9 @@ async def update_status(
     thread = bot.get_channel(thread_id) if thread_id else None
     if chan and main_msg_id:
         try:
+            # fetch FIRST, then read / patch
+            main_msg: discord.Message = await chan.fetch_message(main_msg_id)
+
             if new_status == "resolved":
                 fresh = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
             elif new_status == "pending":
@@ -242,12 +250,12 @@ async def update_status(
                     await main_msg.unpin()
             except discord.HTTPException:
                 pass
-        except discord.NotFound:
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
     if thread:
         try:
-            first = await _first_message(thread)
-            if first:
+            header = await _thread_header(thread, bot)
+            if header:
                 if new_status == "resolved":
                     fresh = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
                 elif new_status == "pending":
@@ -256,8 +264,8 @@ async def update_status(
                 else:
                     fresh = f"- Status: {STATUSES[new_status]}"
 
-                fixed = _replace_status_block(first.content.splitlines(), fresh)
-                await first.edit(content="\n".join(fixed))
+                fixed = _replace_status_block(header.content.splitlines(), fresh)
+                await header.edit(content="\n".join(fixed))
         except discord.NotFound:
             pass
 
@@ -283,6 +291,9 @@ class RespondModal(Modal, title="Send response"):
         self.add_item(self.res_flag)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Defer right away so we get 15\u202Fmin instead of 3\u202Fs
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         resolve_it = (self.res_flag.value or "").lower() == "y"
         await send_oversight_response(
             interaction, self.ticket_id, self.body.value, mark_resolved=resolve_it
@@ -300,6 +311,7 @@ class FollowUpModal(Modal, title="Send a follow-up to Oversight"):
         self.add_item(self.msg)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await post_followup_from_user(interaction, self.ticket_id, self.msg.value)
 
 class RequestView(View):
@@ -312,6 +324,7 @@ class RequestView(View):
             if not await has_oversight_perm(inter.user):
                 await inter.response.send_message("Not authorised.", ephemeral=True)
                 return
+            await inter.response.defer(ephemeral=True, thinking=True)
             await resolve_request(inter, self.ticket_id)
         resolve_btn = Button(
             label="Resolve",
@@ -403,7 +416,7 @@ async def resolve_request(inter: discord.Interaction, ticket_id: int):
     thread = bot.get_channel(thread_id) if (thread_id := thread_id) else None
     if thread:
         await thread.send(f"✅ Resolved by {inter.user.mention}")
-    await inter.response.send_message("✅ Resolved.", ephemeral=True)
+    await _reply_ephemeral(inter, "✅ Resolved.")
 
 async def send_oversight_response(
     inter: discord.Interaction,
@@ -465,10 +478,11 @@ async def send_oversight_response(
             await db.commit()
         await update_status(bot, row_id, "resolved")
 
-    await inter.response.send_message(
-        "✅ Response sent." if not mark_resolved
-        else "✅ Response sent and request resolved.",
-        ephemeral=True,
+    await _reply_ephemeral(
+        inter,
+        "\u2705 Response sent."
+        if not mark_resolved
+        else "\u2705 Response sent and request resolved.",
     )
 
 async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, body: str):
@@ -506,7 +520,7 @@ async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, bo
             await db.commit()
         await update_status(bot, row_id, "resolved_followup")
 
-    await inter.response.send_message("✅ Sent to Oversight.", ephemeral=True)
+    await _reply_ephemeral(inter, "✅ Sent to Oversight.")
 
 # Slash commands
 def oversighter_only():
@@ -541,6 +555,10 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
                 ephemeral=True,
             )
             return
+
+    # All long‑running work begins here – immediately defer so the token
+    # stays valid (>3 s rule).
+    await ix.response.defer(ephemeral=True)
 
     ticket_id = await create_request_record(ix.user.id, request_text)
 
@@ -579,18 +597,20 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
         f"✅ Your Oversight request **#{ticket_id}** has been filed.",
         view=FollowUpButtonView(ticket_id),
     )
-    await ix.response.send_message("Request filed – check your DMs!", ephemeral=True)
+    await ix.followup.send("Request filed – check your DMs!", ephemeral=True)
 
 @bot.tree.command(name="respond", description="Send a response to a request", guild=CLAIM_GUILD)
 @oversighter_only()
 @app_commands.describe(request_id="Ticket ID", response_text="Your response")
 async def respond_cmd(ix: discord.Interaction, request_id: int, response_text: str):
+    await ix.response.defer(ephemeral=True, thinking=True)
     await send_oversight_response(ix, request_id, response_text)
 
 @bot.tree.command(name="resolve", description="Resolve an Oversight request", guild=CLAIM_GUILD)
 @oversighter_only()
 @app_commands.describe(request_id="Ticket ID to resolve")
 async def resolve_cmd(ix: discord.Interaction, request_id: int):
+    await ix.response.defer(ephemeral=True, thinking=True)
     await resolve_request(ix, request_id)
 
 @bot.tree.command(name="pending", description="List open requests", guild=CLAIM_GUILD)
@@ -640,5 +660,13 @@ async def reminder_loop(bot: commands.Bot):
 @bot.event
 async def on_ready():
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+
+# Safely send an ephemeral acknowledgement, regardless of whether the
+# interaction was already answered/deferred.
+async def _reply_ephemeral(inter: discord.Interaction, content: str):
+    if inter.response.is_done():
+        await inter.followup.send(content, ephemeral=True)
+    else:
+        await inter.response.send_message(content, ephemeral=True)
 
 bot.run(TOKEN)
