@@ -613,14 +613,14 @@ async def send_oversight_response(
         )
     else:
         await user.send(
-            f"**Message from the Oversight team on request #{ticket_id}:**\n>{text}",
+            f"**Message from the Oversight team regarding request #{ticket_id}:**\n>{text}",
             view=FollowUpButtonView(ticket_id),
         )
 
     # Echo into thread
     thread = bot.get_channel(thread_id)
     if thread:
-        await thread.send(f"**Response to requester by Oversighter {inter.user.mention}:**\n> {text}")
+        await thread.send(f"**Message to requester by Oversighter {inter.user.mention}:**\n> {text}")
 
     if mark_resolved:
         await db.update_request_status(ticket_id, "resolved", inter.user.id)
@@ -687,7 +687,7 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
     # Gate by role if configured
     if SUBMITTER_ROLE_ID and not any(r.id in SUBMITTER_ROLE_ID for r in ix.user.roles):
         await ix.response.send_message(
-            "You are not authorised to submit Oversight requests here.",
+            "You are not authorised to submit Oversight requests here. Please submit your request as described in the [English Wikipedia page on requesting Oversight](https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight).",
             ephemeral=True,
         )
         return
@@ -697,7 +697,7 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
     cnt = await db.count_user_requests_in_window(ix.user.id, cutoff)
     if cnt >= 2 and not await has_oversight_perm(ix.user):
         await ix.response.send_message(
-            f"⏳ You may only file 2 requests every {COOLDOWN_SECONDS}s.",
+            f"You may only file 2 requests every {COOLDOWN_SECONDS}s. If you need to file more requests, please submit your request as described in the [English Wikipedia page on requesting Oversight](https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight).",
             ephemeral=True,
         )
         return
@@ -759,7 +759,7 @@ async def resolve_cmd(ix: discord.Interaction, request_id: int):
 async def pending_cmd(ix: discord.Interaction):
     ids = await db.get_open_requests()
     if not ids:
-        await ix.response.send_message("✅ No open requests.", ephemeral=True)
+        await ix.response.send_message("No open requests.", ephemeral=True)
     else:
         await ix.response.send_message(
             "Open requests: " + ", ".join(f"`{i}`" for i in ids),
@@ -776,9 +776,10 @@ async def reminder_loop(bot: commands.Bot):
             user = await bot.fetch_user(author_id)
             try:
                 await user.send(
-                    f"⏰ Heads-up: your Oversight request #{ext_id} "
-                    f"has not yet been resolved.\n\n> {text}\n\n"
-                    "An Oversighter will review it as soon as possible."
+                    f"[Automated notice:] Your Oversight request #{ext_id} "
+                    f"reading as follows has not yet been resolved in the {REMINDER_MINUTES} minutes since it was submitted.\n\n> {text}\n\n"
+                    "Please consider following the steps outlined in the"
+                    "[English Wikipedia page on requesting Oversight](https://en.wikipedia.org/wiki/Wikipedia:Requests_for_oversight)."
                 )
             except discord.HTTPException:
                 pass
