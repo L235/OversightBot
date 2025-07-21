@@ -66,7 +66,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("oversight-modmail")
+log = logging.getLogger(__name__)
 
 # ─────────────── ticket lifecycle labels ────────────────
 # NB: "pending" keeps a placeholder; the actor/target names are
