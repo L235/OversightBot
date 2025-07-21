@@ -4,20 +4,20 @@ Discord Oversight Request Bot  –  Modmail-style edition  (2025-07-21)
 New workflow highlights
 ────────────────────────────────────────────────────────────────────────────
 • Every request spawns a **private thread** in the restricted channel.
-  – Thread title  :  “Request #<ID>”
+  – Thread title  :  "Request #<ID>"
   – First post    :  Same embed/message that appears in the main channel
 • Main-channel message AND thread header both show live status.
-  (“🟢 Open”, “✅ Resolved”, “✅ Resolved – follow-up sent”)
+  ("🟢 Open", "✅ Resolved", "✅ Resolved – follow-up sent")
 • Buttons & commands
     – **Resolve**  (button or  `/resolve`)   → marks request resolved
     – **Respond**  (button or  `/respond`)   → sends reply but keeps status
 • All acknowledgements go to the requester via **DMs** (not ephemerals)
-  – DMs include a **“Follow-up”** button so the user can message Oversight;
+  – DMs include a **"Follow-up"** button so the user can message Oversight;
     their follow-up is posted to the thread and status flips to
-    “Resolved – follow-up sent”.
+    "Resolved – follow-up sent".
 • All main-channel request messages are **pinned while open** and un-pinned
   on resolution.
-• Database schema simplified:  no “claimed” fields, instead
+• Database schema simplified:  no "claimed" fields, instead
       status TEXT  ('open' | 'resolved' | 'resolved_followup')
       thread_id INTEGER
       message_id INTEGER
@@ -32,7 +32,7 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional, Set, List
+from typing import Optional, Set, List, Dict, Any, Tuple
 
 import aiosqlite
 import discord
@@ -69,7 +69,7 @@ logging.basicConfig(
 log = logging.getLogger("oversight-modmail")
 
 # ─────────────── ticket lifecycle labels ────────────────
-# NB: “pending” keeps a placeholder; the actor/target names are
+# NB: "pending" keeps a placeholder; the actor/target names are
 #     appended dynamically in update_status().
 STATUSES = {
     "open":              "🟡 Open",
@@ -97,53 +97,245 @@ CREATE TABLE IF NOT EXISTS oversighters      (user_id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS ping_subscribers (user_id INTEGER PRIMARY KEY);
 """
 
+
+class DatabaseManager:
+    """Manages all database operations for the OversightBot."""
+    
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+    
+    async def initialize(self) -> None:
+        """Initialize the database with required tables."""
+        async with aiosqlite.connect(self.db_path) as db:
+            for stmt in CREATE_SQL.strip().split(";"):
+                if stmt.strip():
+                    await db.execute(stmt)
+            # Idempotent migration for older installs
+            try:
+                await db.execute("ALTER TABLE requests ADD COLUMN last_oversighter_id INTEGER")
+            except aiosqlite.OperationalError:
+                pass  # already present
+            await db.commit()
+    
+    # ID conversion utilities
+    def ext2row(self, ext_id: int) -> int:
+        """Convert external ID to internal row ID."""
+        val = ext_id - ID_OFFSET
+        if val <= 0:
+            raise ValueError(f"Invalid external ID: {ext_id}")
+        return val
+    
+    def row2ext(self, row_id: int) -> int:
+        """Convert internal row ID to external ID."""
+        return row_id + ID_OFFSET
+    
+    # Request operations
+    async def create_request(self, author_id: int, text: str) -> int:
+        """Create a new request and return its external ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            ts = int(datetime.now(timezone.utc).timestamp())
+            cur = await db.execute(
+                "INSERT INTO requests (author_id, text, created_at) VALUES (?,?,?)",
+                (author_id, text, ts),
+            )
+            await db.commit()
+            return self.row2ext(cur.lastrowid)
+    
+    async def get_request(self, ticket_id: int) -> Optional[Dict[str, Any]]:
+        """Get request details by external ID."""
+        row_id = self.ext2row(ticket_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT id, author_id, text, created_at, status, thread_id, message_id, "
+                "resolved_by, resolved_at, last_oversighter_id, reminded_at "
+                "FROM requests WHERE id = ?",
+                (row_id,)
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            
+            return {
+                'id': self.row2ext(row[0]),
+                'author_id': row[1],
+                'text': row[2],
+                'created_at': row[3],
+                'status': row[4],
+                'thread_id': row[5],
+                'message_id': row[6],
+                'resolved_by': row[7],
+                'resolved_at': row[8],
+                'last_oversighter_id': row[9],
+                'reminded_at': row[10]
+            }
+    
+    async def get_request_status(self, ticket_id: int) -> Optional[str]:
+        """Get request status by external ID."""
+        row_id = self.ext2row(ticket_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT status FROM requests WHERE id = ?", (row_id,))
+            row = await cur.fetchone()
+            return row[0] if row else None
+    
+    async def get_request_locations(self, ticket_id: int) -> Optional[Tuple[int, int]]:
+        """Get message_id and thread_id for a request."""
+        row_id = self.ext2row(ticket_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT message_id, thread_id FROM requests WHERE id = ?", (row_id,))
+            row = await cur.fetchone()
+            return (row[0], row[1]) if row else None
+    
+    async def update_request_locations(self, ticket_id: int, message_id: int, thread_id: int) -> None:
+        """Update message_id and thread_id for a request."""
+        row_id = self.ext2row(ticket_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE requests SET message_id=?, thread_id=? WHERE id=?",
+                (message_id, thread_id, row_id),
+            )
+            await db.commit()
+    
+    async def resolve_request(self, ticket_id: int, resolved_by: int) -> bool:
+        """Resolve a request. Returns True if successful, False if already resolved."""
+        row_id = self.ext2row(ticket_id)
+        ts = int(datetime.now(timezone.utc).timestamp())
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE requests SET status='resolved', resolved_by=?, resolved_at=? "
+                "WHERE id=? AND status='open'",
+                (resolved_by, ts, row_id),
+            )
+            await db.commit()
+            return db.total_changes > 0
+    
+    async def update_request_status(self, ticket_id: int, status: str, 
+                                  last_oversighter_id: Optional[int] = None) -> None:
+        """Update request status."""
+        row_id = self.ext2row(ticket_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            if last_oversighter_id is not None:
+                await db.execute(
+                    "UPDATE requests SET status=?, last_oversighter_id=? WHERE id=?",
+                    (status, last_oversighter_id, row_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE requests SET status=? WHERE id=?", (status, row_id)
+                )
+            await db.commit()
+    
+    async def mark_request_reminded(self, ticket_id: int) -> None:
+        """Mark a request as reminded."""
+        row_id = self.ext2row(ticket_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE requests SET reminded_at=strftime('%s','now') WHERE id=?",
+                (row_id,),
+            )
+            await db.commit()
+    
+    async def get_open_requests(self) -> List[int]:
+        """Get list of open request external IDs."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT id FROM requests WHERE status='open' ORDER BY id")
+            return [self.row2ext(r[0]) for r in await cur.fetchall()]
+    
+    async def get_reminder_candidates(self, cutoff_timestamp: int) -> List[Tuple[int, int, str]]:
+        """Get requests that need reminders (returns row_id, author_id, text)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT id, author_id, text FROM requests "
+                "WHERE status='open' AND created_at<? AND reminded_at IS NULL",
+                (cutoff_timestamp,),
+            )
+            return await cur.fetchall()
+    
+    async def count_user_requests_in_window(self, user_id: int, cutoff_timestamp: int) -> int:
+        """Count requests by user in time window."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM requests WHERE author_id=? AND created_at>=?",
+                (user_id, cutoff_timestamp),
+            )
+            (cnt,) = await cur.fetchone()
+            return cnt
+    
+    # Oversighter management
+    async def is_oversighter(self, user_id: int, bot_admins: set) -> bool:
+        """Check if user is an oversighter."""
+        if user_id in bot_admins:
+            return True
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT 1 FROM oversighters WHERE user_id = ? LIMIT 1", (user_id,))
+            return await cur.fetchone() is not None
+    
+    async def add_oversighter(self, user_id: int) -> None:
+        """Add user as oversighter."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("INSERT OR IGNORE INTO oversighters VALUES (?)", (user_id,))
+            await db.commit()
+    
+    async def remove_oversighter(self, user_id: int) -> None:
+        """Remove user as oversighter."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM oversighters WHERE user_id = ?", (user_id,))
+            await db.commit()
+    
+    # Ping subscription management
+    async def add_ping_subscriber(self, user_id: int) -> None:
+        """Add user to ping subscribers."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("INSERT OR IGNORE INTO ping_subscribers VALUES (?)", (user_id,))
+            await db.commit()
+    
+    async def remove_ping_subscriber(self, user_id: int) -> None:
+        """Remove user from ping subscribers."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM ping_subscribers WHERE user_id = ?", (user_id,))
+            await db.commit()
+    
+    async def get_ping_subscribers(self) -> List[int]:
+        """Get list of ping subscriber user IDs."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT user_id FROM ping_subscribers")
+            return [r[0] for r in await cur.fetchall()]
+
+
+# Global database manager instance
+db = DatabaseManager()
+
+
+# Legacy function wrappers for backward compatibility
 async def init_db() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        for stmt in CREATE_SQL.strip().split(";"):
-            if stmt.strip():
-                await db.execute(stmt)
-        # Idempotent migration for older installs
-        try:
-            await db.execute("ALTER TABLE requests ADD COLUMN last_oversighter_id INTEGER")
-        except aiosqlite.OperationalError:
-            pass  # already present
-        await db.commit()
+    """Initialize the database."""
+    await db.initialize()
 
 def ext2row(ext_id: int) -> int:
-    val = ext_id - ID_OFFSET
-    if val <= 0:
-        raise ValueError
-    return val
+    """Convert external ID to internal row ID."""
+    return db.ext2row(ext_id)
 
 def row2ext(row_id: int) -> int:
-    return row_id + ID_OFFSET
+    """Convert internal row ID to external ID."""
+    return db.row2ext(row_id)
 
-# Utility helpers
 async def add_ping(uid: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO ping_subscribers VALUES (?)", (uid,))
-        await db.commit()
+    """Add user to ping subscribers."""
+    await db.add_ping_subscriber(uid)
 
 async def rm_ping(uid: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM ping_subscribers WHERE user_id = ?", (uid,))
-        await db.commit()
+    """Remove user from ping subscribers."""
+    await db.remove_ping_subscriber(uid)
 
 async def ping_list() -> List[int]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM ping_subscribers")
-        return [r[0] for r in await cur.fetchall()]
+    """Get list of ping subscriber user IDs."""
+    return await db.get_ping_subscribers()
 
 async def is_oversighter(uid: int) -> bool:
-    if uid in BOT_ADMINS:
-        return True
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT 1 FROM oversighters WHERE user_id = ? LIMIT 1", (uid,))
-        if await cur.fetchone():
-            return True
-    return False
+    """Check if user is an oversighter."""
+    return await db.is_oversighter(uid, BOT_ADMINS)
 
 async def has_oversight_perm(member: discord.Member) -> bool:
+    """Check if member has oversight permissions."""
     if await is_oversighter(member.id):
         return True
     return any(role.id in OVERSIGHT_ROLE_ID for role in member.roles)
@@ -185,8 +377,8 @@ async def render_request(ticket_id: int,
 
 def _replace_status_block(lines: List[str], fresh: str) -> List[str]:
     """
-    Remove *all* existing “Status:” lines and insert the fresh one right after
-    the “- ID:” line.  This guarantees exactly one status line every time.
+    Remove *all* existing "Status:" lines and insert the fresh one right after
+    the "- ID:" line.  This guarantees exactly one status line every time.
     """
     cleaned, inserted = [], False
     for ln in lines:
@@ -218,12 +410,10 @@ async def update_status(
     actor_id: int | None = None,   # oversighter performing the action
     target_id: int | None = None,  # user waiting to reply
 ) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT message_id, thread_id FROM requests WHERE id = ?", (row_id,))
-        row = await cur.fetchone()
-    if not row:
+    locations = await db.get_request_locations(db.row2ext(row_id))
+    if not locations:
         return
-    main_msg_id, thread_id = row
+    main_msg_id, thread_id = locations
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
     thread = bot.get_channel(thread_id) if thread_id else None
     
@@ -273,7 +463,7 @@ class RespondModal(Modal, title="Send response"):
         )
         self.add_item(self.body)
 
-        # “Checkbox” (TextInput because Modals only accept TextInput)
+        # "Checkbox" (TextInput because Modals only accept TextInput)
         self.res_flag = TextInput(
             label="Resolve request? (y/N)",
             style=discord.TextStyle.short,
@@ -358,52 +548,39 @@ class FollowUpButtonView(View):
 
 # Core actions
 async def create_request_record(author_id: int, text: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        ts = int(datetime.now(timezone.utc).timestamp())
-        cur = await db.execute(
-            "INSERT INTO requests (author_id, text, created_at) VALUES (?,?,?)",
-            (author_id, text, ts),
-        )
-        await db.commit()
-        return row2ext(cur.lastrowid)
+    return await db.create_request(author_id, text)
 
 async def resolve_request(inter: discord.Interaction, ticket_id: int):
-    row_id = ext2row(ticket_id)
-
     # ── short‑circuit if already resolved ───────────────────────────────
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT status FROM requests WHERE id=?", (row_id,))
-        row = await cur.fetchone()
-    if not row:
+    status = await db.get_request_status(ticket_id)
+    if not status:
         await _reply_ephemeral(inter, "Unknown request ID.")
         return
-    if row[0] == "resolved":
+    if status == "resolved":
         await _reply_ephemeral(inter, "That request is already resolved.")
         return
 
-    ts = int(datetime.now(timezone.utc).timestamp())
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE requests SET status='resolved', resolved_by=?, resolved_at=? "
-            "WHERE id=? AND status='open'",
-            (inter.user.id, ts, row_id),
-        )
-        await db.commit()
+    success = await db.resolve_request(ticket_id, inter.user.id)
+    if not success:
+        await _reply_ephemeral(inter, "That request is already resolved.")
+        return
 
-    await update_status(bot, row_id, "resolved", actor_id=inter.user.id)
+    await update_status(bot, db.ext2row(ticket_id), "resolved", actor_id=inter.user.id)
 
     # Notify requester
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT author_id, thread_id FROM requests WHERE id=?", (row_id,))
-        (uid, thread_id) = await cur.fetchone()
-    user = await bot.fetch_user(uid)
+    request_data = await db.get_request(ticket_id)
+    if not request_data:
+        await _reply_ephemeral(inter, "Unknown request ID.")
+        return
+    
+    user = await bot.fetch_user(request_data['author_id'])
     await user.send(
         f"Your Oversight request **#{ticket_id}** has been **resolved** by a member of the Oversight team.",
         view=FollowUpButtonView(ticket_id),
     )
 
     # Post a note inside the thread for context
-    thread = bot.get_channel(thread_id) if (thread_id := thread_id) else None
+    thread = bot.get_channel(request_data['thread_id']) if request_data['thread_id'] else None
     if thread:
         await thread.send(f"✅ Ticket #{ticket_id} resolved by {inter.user.mention}.")
     await _reply_ephemeral(inter, "✅ Resolved.")
@@ -415,15 +592,14 @@ async def send_oversight_response(
     *,
     mark_resolved: bool = False,
 ):
-    row_id = ext2row(ticket_id)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT author_id, thread_id, status FROM requests WHERE id=?", (row_id,)
-        )
-        row = await cur.fetchone()
-    if not row:
-        await _reply_ephemeral(inter, "Unknown ID."); return
-    author_id, thread_id, status = row
+    request_data = await db.get_request(ticket_id)
+    if not request_data:
+        await _reply_ephemeral(inter, "Unknown ID.")
+        return
+    
+    author_id = request_data['author_id']
+    thread_id = request_data['thread_id']
+    status = request_data['status']
 
     # DM the user
     user = await bot.fetch_user(author_id)
@@ -447,35 +623,19 @@ async def send_oversight_response(
         await thread.send(f"**Response to requester by Oversighter {inter.user.mention}:**\n> {text}")
 
     if mark_resolved:
-        ts_now = int(datetime.now(timezone.utc).timestamp())
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE requests SET status='resolved', resolved_by=?, resolved_at=?, "
-                "last_oversighter_id=? WHERE id=?",
-                (inter.user.id, ts_now, inter.user.id, row_id),
-            )
-            await db.commit()
-        await update_status(bot, row_id, "resolved", actor_id=inter.user.id)
+        await db.update_request_status(ticket_id, "resolved", inter.user.id)
+        await update_status(bot, db.ext2row(ticket_id), "resolved", actor_id=inter.user.id)
     else:
         # ► pending
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE requests SET status='pending', last_oversighter_id=? WHERE id=?",
-                (inter.user.id, row_id),
-            )
-            await db.commit()
+        await db.update_request_status(ticket_id, "pending", inter.user.id)
         await update_status(
-            bot, row_id, "pending", actor_id=inter.user.id, target_id=author_id
+            bot, db.ext2row(ticket_id), "pending", actor_id=inter.user.id, target_id=author_id
         )
 
-    # If it *used to be* “follow‑up resolved”, drop the extra flag
+    # If it *used to be* "follow‑up resolved", drop the extra flag
     if status == "resolved_followup":
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE requests SET status='resolved' WHERE id=?", (row_id,)
-            )
-            await db.commit()
-        await update_status(bot, row_id, "resolved")
+        await db.update_request_status(ticket_id, "resolved")
+        await update_status(bot, db.ext2row(ticket_id), "resolved")
 
     await _reply_ephemeral(
         inter,
@@ -485,18 +645,19 @@ async def send_oversight_response(
     )
 
 async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, body: str):
-    row_id = ext2row(ticket_id)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT thread_id, status, last_oversighter_id FROM requests WHERE id=?", (row_id,)
-        )
-        row = await cur.fetchone()
-    if not row:
-        await _reply_ephemeral(inter, "Sorry, I couldn't find that request."); return
-    thread_id, status, last_ov = row
+    request_data = await db.get_request(ticket_id)
+    if not request_data:
+        await _reply_ephemeral(inter, "Sorry, I couldn't find that request.")
+        return
+    
+    thread_id = request_data['thread_id']
+    status = request_data['status']
+    last_ov = request_data['last_oversighter_id']
+    
     thread = bot.get_channel(thread_id)
     if not thread:
-        await _reply_ephemeral(inter, "Thread no longer exists."); return
+        await _reply_ephemeral(inter, "Thread no longer exists.")
+        return
 
     ping = f"<@{last_ov}> " if last_ov else ""
     await thread.send(f"{ping}**Follow‑up from <@{inter.user.id}>:**\n> {body}")
@@ -504,20 +665,11 @@ async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, bo
     # Transition matrix
     if status == "pending":
         # awaiting oversighter – reopen
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE requests SET status='open', last_oversighter_id=NULL WHERE id=?",
-                (row_id,),
-            )
-            await db.commit()
-        await update_status(bot, row_id, "open")
+        await db.update_request_status(ticket_id, "open")
+        await update_status(bot, db.ext2row(ticket_id), "open")
     elif status == "resolved":
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE requests SET status='resolved_followup' WHERE id=?", (row_id,)
-            )
-            await db.commit()
-        await update_status(bot, row_id, "resolved_followup")
+        await db.update_request_status(ticket_id, "resolved_followup")
+        await update_status(bot, db.ext2row(ticket_id), "resolved_followup")
 
     await _reply_ephemeral(inter, f"Your follow-up has been sent to the Oversight team: \n> {body}")
 
@@ -541,27 +693,22 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
         return
 
     # Rate limiting (Oversighters & admins exempt)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cutoff = int(datetime.now(timezone.utc).timestamp()) - COOLDOWN_SECONDS
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM requests WHERE author_id=? AND created_at>=?",
-            (ix.user.id, cutoff),
+    cutoff = int(datetime.now(timezone.utc).timestamp()) - COOLDOWN_SECONDS
+    cnt = await db.count_user_requests_in_window(ix.user.id, cutoff)
+    if cnt >= 2 and not await has_oversight_perm(ix.user):
+        await ix.response.send_message(
+            f"⏳ You may only file 2 requests every {COOLDOWN_SECONDS}s.",
+            ephemeral=True,
         )
-        (cnt,) = await cur.fetchone()
-        if cnt >= 2 and not await has_oversight_perm(ix.user):
-            await ix.response.send_message(
-                f"⏳ You may only file 2 requests every {COOLDOWN_SECONDS}s.",
-                ephemeral=True,
-            )
-            return
+        return
 
     # All long‑running work begins here – immediately defer so the token
-    # stays valid (>3 s rule).
+    # stays valid (>3 s rule).
     await ix.response.defer(ephemeral=True)
 
     ticket_id = await create_request_record(ix.user.id, request_text)
 
-    # First draft (thread doesn’t exist yet)
+    # First draft (thread doesn't exist yet)
     content = await render_request(
         ticket_id, ix.user.mention, request_text, STATUSES["open"]
     )
@@ -580,12 +727,7 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
     thread_msg = await thread.send(content, view=RequestView(ticket_id))
 
     # Save locations
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE requests SET message_id=?, thread_id=? WHERE id=?",
-            (main_msg.id, thread.id, ext2row(ticket_id)),
-        )
-        await db.commit()
+    await db.update_request_locations(ticket_id, main_msg.id, thread.id)
 
     # Ping subscribers
     if (subs := await ping_list()):
@@ -615,9 +757,7 @@ async def resolve_cmd(ix: discord.Interaction, request_id: int):
 @bot.tree.command(name="pending", description="List open requests", guild=CLAIM_GUILD)
 @oversighter_only()
 async def pending_cmd(ix: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id FROM requests WHERE status='open' ORDER BY id")
-        ids = [row2ext(r[0]) for r in await cur.fetchall()]
+    ids = await db.get_open_requests()
     if not ids:
         await ix.response.send_message("✅ No open requests.", ephemeral=True)
     else:
@@ -630,29 +770,19 @@ async def pending_cmd(ix: discord.Interaction):
 async def reminder_loop(bot: commands.Bot):
     while not bot.is_closed():
         cutoff = int(datetime.now(timezone.utc).timestamp()) - REMINDER_MINUTES * 60
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT id, author_id, text FROM requests "
-                "WHERE status='open' AND created_at<? AND reminded_at IS NULL",
-                (cutoff,),
-            )
-            rows = await cur.fetchall()
-            for row_id, author_id, text in rows:
-                ext_id = row2ext(row_id)
-                user = await bot.fetch_user(author_id)
-                try:
-                    await user.send(
-                        f"⏰ Heads-up: your Oversight request #{ext_id} "
-                        f"has not yet been resolved.\n\n> {text}\n\n"
-                        "An Oversighter will review it as soon as possible."
-                    )
-                except discord.HTTPException:
-                    pass
-                await db.execute(
-                    "UPDATE requests SET reminded_at=strftime('%s','now') WHERE id=?",
-                    (row_id,),
+        candidates = await db.get_reminder_candidates(cutoff)
+        for row_id, author_id, text in candidates:
+            ext_id = db.row2ext(row_id)
+            user = await bot.fetch_user(author_id)
+            try:
+                await user.send(
+                    f"⏰ Heads-up: your Oversight request #{ext_id} "
+                    f"has not yet been resolved.\n\n> {text}\n\n"
+                    "An Oversighter will review it as soon as possible."
                 )
-            await db.commit()
+            except discord.HTTPException:
+                pass
+            await db.mark_request_reminded(ext_id)
         await asyncio.sleep(60)
 
 # Event hooks
