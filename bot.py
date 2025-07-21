@@ -39,6 +39,7 @@ import discord
 from discord import app_commands
 from discord.ui import View, Button, Modal, TextInput
 from discord.ext import commands
+import re
 
 # Configuration
 TOKEN                    = os.environ["DISCORD_TOKEN"]
@@ -177,6 +178,33 @@ async def render_request(ticket_id: int,
         f"(Thread: {thread_link or f'<#{RESTRICTED_CHANNEL_ID}>'})"
     )
 
+# ────────────────────────────────────────────────────────────────────
+# Utilities for tidy status handling
+# ────────────────────────────────────────────────────────────────────
+
+def _replace_status_block(lines: List[str], fresh: str) -> List[str]:
+    """
+    Remove *all* existing “Status:” lines and insert the fresh one right after
+    the “- ID:” line.  This guarantees exactly one status line every time.
+    """
+    cleaned, inserted = [], False
+    for ln in lines:
+        if re.match(r"^-?\s*Status:", ln.strip()):
+            continue                                   # drop stale status lines
+        cleaned.append(ln)
+        if not inserted and ln.strip().startswith("- ID:"):
+            cleaned.append(fresh)
+            inserted = True
+    if not inserted:                                  # malformed message; fall‑back
+        cleaned.insert(1, fresh)
+    return cleaned
+
+async def _first_message(thread: discord.Thread) -> Optional[discord.Message]:
+    """Return the very first message in a thread (oldest_first history)."""
+    async for m in thread.history(limit=1, oldest_first=True):
+        return m
+    return None
+
 async def update_status(
     bot: commands.Bot,
     row_id: int,
@@ -195,32 +223,41 @@ async def update_status(
     thread = bot.get_channel(thread_id) if thread_id else None
     if chan and main_msg_id:
         try:
-            main_msg = await chan.fetch_message(main_msg_id)
-            parts = main_msg.content.split("\n")
             if new_status == "resolved":
-                parts[1] = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
+                fresh = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
             elif new_status == "pending":
-                parts[1] = (f"- Status: {STATUSES[new_status]} "
-                            f"from <@{actor_id}> → <@{target_id}>")
+                fresh = (f"- Status: {STATUSES[new_status]} "
+                         f"from <@{actor_id}> → <@{target_id}>")
             else:
-                parts[1] = f"- Status: {STATUSES[new_status]}"
-            await main_msg.edit(content="\n".join(parts))
-            if new_status == "resolved":
-                await main_msg.unpin()
+                fresh = f"- Status: {STATUSES[new_status]}"
+
+            patched = _replace_status_block(main_msg.content.splitlines(), fresh)
+            await main_msg.edit(content="\n".join(patched))
+
+            # pin / un‑pin -------------------------------------------------
+            try:
+                if new_status in ("open", "pending", "resolved_followup"):
+                    await main_msg.pin()
+                elif new_status == "resolved":
+                    await main_msg.unpin()
+            except discord.HTTPException:
+                pass
         except discord.NotFound:
             pass
     if thread:
         try:
-            first = await thread.fetch_message(thread.last_message_id)
-            parts = first.content.split("\n")
-            if new_status == "resolved":
-                parts[1] = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
-            elif new_status == "pending":
-                parts[1] = (f"- Status: {STATUSES[new_status]} "
-                            f"from <@{actor_id}> → <@{target_id}>")
-            else:
-                parts[1] = f"- Status: {STATUSES[new_status]}"
-            await first.edit(content="\n".join(parts))
+            first = await _first_message(thread)
+            if first:
+                if new_status == "resolved":
+                    fresh = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
+                elif new_status == "pending":
+                    fresh = (f"- Status: {STATUSES[new_status]} "
+                             f"from <@{actor_id}> → <@{target_id}>")
+                else:
+                    fresh = f"- Status: {STATUSES[new_status]}"
+
+                fixed = _replace_status_block(first.content.splitlines(), fresh)
+                await first.edit(content="\n".join(fixed))
         except discord.NotFound:
             pass
 
@@ -236,8 +273,20 @@ class RespondModal(Modal, title="Send response"):
         )
         self.add_item(self.body)
 
+        # “Checkbox” (TextInput because Modals only accept TextInput)
+        self.res_flag = TextInput(
+            label="Resolve request? (y/N)",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=1,
+        )
+        self.add_item(self.res_flag)
+
     async def on_submit(self, interaction: discord.Interaction):
-        await send_oversight_response(interaction, self.ticket_id, self.body.value)
+        resolve_it = (self.res_flag.value or "").lower() == "y"
+        await send_oversight_response(
+            interaction, self.ticket_id, self.body.value, mark_resolved=resolve_it
+        )
 
 class FollowUpModal(Modal, title="Send a follow-up to Oversight"):
     def __init__(self, ticket_id: int):
@@ -315,6 +364,20 @@ async def create_request_record(author_id: int, text: str) -> int:
 
 async def resolve_request(inter: discord.Interaction, ticket_id: int):
     row_id = ext2row(ticket_id)
+
+    # ── short‑circuit if already resolved ───────────────────────────────
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT status FROM requests WHERE id=?", (row_id,))
+        row = await cur.fetchone()
+    if not row:
+        await inter.response.send_message("Unknown request ID.", ephemeral=True)
+        return
+    if row[0] != "open":
+        await inter.response.send_message(
+            "That request is already resolved.", ephemeral=True
+        )
+        return
+
     ts = int(datetime.now(timezone.utc).timestamp())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -342,7 +405,13 @@ async def resolve_request(inter: discord.Interaction, ticket_id: int):
         await thread.send(f"✅ Resolved by {inter.user.mention}")
     await inter.response.send_message("✅ Resolved.", ephemeral=True)
 
-async def send_oversight_response(inter: discord.Interaction, ticket_id: int, text: str):
+async def send_oversight_response(
+    inter: discord.Interaction,
+    ticket_id: int,
+    text: str,
+    *,
+    mark_resolved: bool = False,
+):
     row_id = ext2row(ticket_id)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -365,17 +434,27 @@ async def send_oversight_response(inter: discord.Interaction, ticket_id: int, te
     if thread:
         await thread.send(f"**Oversight response by {inter.user.mention}:**\n> {text}")
 
-    # Mark ticket ↦ «pending reply» and remember who last answered
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE requests SET status='pending', last_oversighter_id=? WHERE id=?",
-            (inter.user.id, row_id),
+    if mark_resolved:
+        ts_now = int(datetime.now(timezone.utc).timestamp())
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE requests SET status='resolved', resolved_by=?, resolved_at=?, "
+                "last_oversighter_id=? WHERE id=?",
+                (inter.user.id, ts_now, inter.user.id, row_id),
+            )
+            await db.commit()
+        await update_status(bot, row_id, "resolved", actor_id=inter.user.id)
+    else:
+        # ► pending
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE requests SET status='pending', last_oversighter_id=? WHERE id=?",
+                (inter.user.id, row_id),
+            )
+            await db.commit()
+        await update_status(
+            bot, row_id, "pending", actor_id=inter.user.id, target_id=author_id
         )
-        await db.commit()
-    await update_status(
-        bot, row_id, "pending",
-        actor_id=inter.user.id, target_id=author_id
-    )
 
     # If it *used to be* “follow‑up resolved”, drop the extra flag
     if status == "resolved_followup":
@@ -386,7 +465,11 @@ async def send_oversight_response(inter: discord.Interaction, ticket_id: int, te
             await db.commit()
         await update_status(bot, row_id, "resolved")
 
-    await inter.response.send_message("✅ Response sent.", ephemeral=True)
+    await inter.response.send_message(
+        "✅ Response sent." if not mark_resolved
+        else "✅ Response sent and request resolved.",
+        ephemeral=True,
+    )
 
 async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, body: str):
     row_id = ext2row(ticket_id)
