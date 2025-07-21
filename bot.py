@@ -269,7 +269,7 @@ class RespondModal(Modal, title="Send response"):
         self.body = TextInput(
             label="Response",
             style=discord.TextStyle.paragraph,
-            placeholder="Type your response…",
+            placeholder="Type your response...",
         )
         self.add_item(self.body)
 
@@ -298,7 +298,7 @@ class FollowUpModal(Modal, title="Send a follow-up to Oversight"):
         self.msg = TextInput(
             label="Your message",
             style=discord.TextStyle.paragraph,
-            placeholder="Type your follow-up…",
+            placeholder="Type your follow-up...",
         )
         self.add_item(self.msg)
 
