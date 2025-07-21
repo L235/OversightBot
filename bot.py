@@ -407,10 +407,9 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
     main_msg = await chan.send(content, view=RequestView(ticket_id))
     await main_msg.pin()
-    # Create private thread
+    # Create a (public) thread – no `type=` kw‑arg needed
     thread = await main_msg.create_thread(
         name=f"Request #{ticket_id}",
-        type=discord.ChannelType.private_thread,
     )
     thread_msg = await thread.send(content, view=RequestView(ticket_id))
 
