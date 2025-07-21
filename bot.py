@@ -539,7 +539,7 @@ class FollowUpButtonView(View):
         async def _follow_cb(inter: discord.Interaction):
             await inter.response.send_modal(FollowUpModal(self.ticket_id))
         follow_btn = Button(
-            label="Send a follow-up message (will reopen request)",
+            label="Send a follow-up message (will reopen request if closed)",
             style=discord.ButtonStyle.secondary,
             custom_id=f"follow_{ticket_id}",
         )
@@ -606,21 +606,24 @@ async def send_oversight_response(
     if mark_resolved:
         await user.send(
             (
-                f"**Your Oversight request **#{ticket_id}** has been **resolved** by a member of the Oversight team."
+                f"Your Oversight request **#{ticket_id}** has been **resolved** by a member of the Oversight team."
                 f"\n\n Message from the Oversight team:\n> {text}"
             ),
             view=FollowUpButtonView(ticket_id),
         )
     else:
         await user.send(
-            f"**Message from the Oversight team regarding request #{ticket_id}:**\n>{text}",
+            f"**Message from the Oversight team regarding request #{ticket_id}:**\n> {text}",
             view=FollowUpButtonView(ticket_id),
         )
 
     # Echo into thread
     thread = bot.get_channel(thread_id)
     if thread:
-        await thread.send(f"**Message to requester by Oversighter {inter.user.mention}:**\n> {text}")
+        if mark_resolved:
+            await thread.send(f"**✅ Ticket #{ticket_id} resolved by {inter.user.mention}.** Message to requester:\n> {text}")
+        else:
+            await thread.send(f"**Message to requester by Oversighter {inter.user.mention}:**\n> {text}")
 
     if mark_resolved:
         await db.update_request_status(ticket_id, "resolved", inter.user.id)
