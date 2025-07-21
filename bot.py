@@ -72,10 +72,10 @@ log = logging.getLogger("oversight-modmail")
 # NB: “pending” keeps a placeholder; the actor/target names are
 #     appended dynamically in update_status().
 STATUSES = {
-    "open":              "🟢 Open",
-    "pending":           "🕒 Pending response",
-    "resolved":          "✅ Resolved",
-    "resolved_followup": "✅ Resolved (follow‑up sent)",
+    "open":              "🟡 Open",
+    "pending":           "🕒 Pending response by requester",
+    "resolved":          "🟢 Resolved",
+    "resolved_followup": "🟡 Reopened by requester",
 }
 
 # Database schema and helpers
@@ -226,28 +226,28 @@ async def update_status(
     main_msg_id, thread_id = row
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
     thread = bot.get_channel(thread_id) if thread_id else None
+    
+    if new_status == "resolved":
+        fresh = f"- Status: {STATUSES[new_status]} by Oversighter <@{actor_id}>"
+    elif new_status == "pending":
+        fresh = (f"- Status: {STATUSES[new_status]} "
+                    f"to Oversighter <@{target_id}>")
+    else:
+        fresh = f"- Status: {STATUSES[new_status]}"
+    
     if chan and main_msg_id:
         try:
             # fetch FIRST, then read / patch
             main_msg: discord.Message = await chan.fetch_message(main_msg_id)
-
-            if new_status == "resolved":
-                fresh = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
-            elif new_status == "pending":
-                fresh = (f"- Status: {STATUSES[new_status]} "
-                         f"from <@{actor_id}> → <@{target_id}>")
-            else:
-                fresh = f"- Status: {STATUSES[new_status]}"
-
             patched = _replace_status_block(main_msg.content.splitlines(), fresh)
             await main_msg.edit(content="\n".join(patched))
 
             # pin / un‑pin -------------------------------------------------
             try:
-                if new_status in ("open", "pending", "resolved_followup"):
-                    await main_msg.pin()
-                elif new_status == "resolved":
+                if new_status == "resolved":
                     await main_msg.unpin()
+                else:
+                    await main_msg.pin()
             except discord.HTTPException:
                 pass
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -256,17 +256,9 @@ async def update_status(
         try:
             header = await _thread_header(thread, bot)
             if header:
-                if new_status == "resolved":
-                    fresh = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
-                elif new_status == "pending":
-                    fresh = (f"- Status: {STATUSES[new_status]} "
-                             f"from <@{actor_id}> → <@{target_id}>")
-                else:
-                    fresh = f"- Status: {STATUSES[new_status]}"
-
                 fixed = _replace_status_block(header.content.splitlines(), fresh)
                 await header.edit(content="\n".join(fixed))
-        except discord.NotFound:
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
 # UI views
@@ -291,7 +283,7 @@ class RespondModal(Modal, title="Send response"):
         self.add_item(self.res_flag)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Defer right away so we get 15\u202Fmin instead of 3\u202Fs
+        # Defer right away so we get 15 min instead of 3 s
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         resolve_it = (self.res_flag.value or "").lower() == "y"
@@ -357,7 +349,7 @@ class FollowUpButtonView(View):
         async def _follow_cb(inter: discord.Interaction):
             await inter.response.send_modal(FollowUpModal(self.ticket_id))
         follow_btn = Button(
-            label="Message Oversight team",
+            label="Send a follow-up message (will reopen request)",
             style=discord.ButtonStyle.secondary,
             custom_id=f"follow_{ticket_id}",
         )
@@ -383,12 +375,10 @@ async def resolve_request(inter: discord.Interaction, ticket_id: int):
         cur = await db.execute("SELECT status FROM requests WHERE id=?", (row_id,))
         row = await cur.fetchone()
     if not row:
-        await inter.response.send_message("Unknown request ID.", ephemeral=True)
+        await _reply_ephemeral(inter, "Unknown request ID.")
         return
-    if row[0] != "open":
-        await inter.response.send_message(
-            "That request is already resolved.", ephemeral=True
-        )
+    if row[0] == "resolved":
+        await _reply_ephemeral(inter, "That request is already resolved.")
         return
 
     ts = int(datetime.now(timezone.utc).timestamp())
@@ -408,14 +398,14 @@ async def resolve_request(inter: discord.Interaction, ticket_id: int):
         (uid, thread_id) = await cur.fetchone()
     user = await bot.fetch_user(uid)
     await user.send(
-        f"Your Oversight request **#{ticket_id}** has been **resolved**.",
+        f"Your Oversight request **#{ticket_id}** has been **resolved** by a member of the Oversight team.",
         view=FollowUpButtonView(ticket_id),
     )
 
     # Post a note inside the thread for context
     thread = bot.get_channel(thread_id) if (thread_id := thread_id) else None
     if thread:
-        await thread.send(f"✅ Resolved by {inter.user.mention}")
+        await thread.send(f"✅ Ticket #{ticket_id} resolved by {inter.user.mention}.")
     await _reply_ephemeral(inter, "✅ Resolved.")
 
 async def send_oversight_response(
@@ -432,20 +422,29 @@ async def send_oversight_response(
         )
         row = await cur.fetchone()
     if not row:
-        await inter.response.send_message("Unknown ID.", ephemeral=True); return
+        await _reply_ephemeral(inter, "Unknown ID."); return
     author_id, thread_id, status = row
 
     # DM the user
     user = await bot.fetch_user(author_id)
-    await user.send(
-        f"**Oversight team response on request #{ticket_id}:**\n{text}",
-        view=FollowUpButtonView(ticket_id),
-    )
+    if mark_resolved:
+        await user.send(
+            (
+                f"**Your Oversight request **#{ticket_id}** has been **resolved** by a member of the Oversight team."
+                f"\n\n Message from the Oversight team:\n> {text}"
+            ),
+            view=FollowUpButtonView(ticket_id),
+        )
+    else:
+        await user.send(
+            f"**Message from the Oversight team on request #{ticket_id}:**\n>{text}",
+            view=FollowUpButtonView(ticket_id),
+        )
 
     # Echo into thread
     thread = bot.get_channel(thread_id)
     if thread:
-        await thread.send(f"**Oversight response by {inter.user.mention}:**\n> {text}")
+        await thread.send(f"**Response to requester by Oversighter {inter.user.mention}:**\n> {text}")
 
     if mark_resolved:
         ts_now = int(datetime.now(timezone.utc).timestamp())
@@ -493,11 +492,11 @@ async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, bo
         )
         row = await cur.fetchone()
     if not row:
-        await inter.response.send_message("Sorry, I couldn't find that request.", ephemeral=True); return
+        await _reply_ephemeral(inter, "Sorry, I couldn't find that request."); return
     thread_id, status, last_ov = row
     thread = bot.get_channel(thread_id)
     if not thread:
-        await inter.response.send_message("Thread no longer exists.", ephemeral=True); return
+        await _reply_ephemeral(inter, "Thread no longer exists."); return
 
     ping = f"<@{last_ov}> " if last_ov else ""
     await thread.send(f"{ping}**Follow‑up from <@{inter.user.id}>:**\n> {body}")
@@ -520,7 +519,7 @@ async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, bo
             await db.commit()
         await update_status(bot, row_id, "resolved_followup")
 
-    await _reply_ephemeral(inter, "✅ Sent to Oversight.")
+    await _reply_ephemeral(inter, f"Your follow-up has been sent to the Oversight team: \n> {body}")
 
 # Slash commands
 def oversighter_only():
@@ -594,10 +593,10 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
 
     # DM acknowledgement
     await ix.user.send(
-        f"✅ Your Oversight request **#{ticket_id}** has been filed.",
+        f"Your Oversight request **#{ticket_id}** has been filed with the following text:\n\n> {request_text}",
         view=FollowUpButtonView(ticket_id),
     )
-    await ix.followup.send("Request filed – check your DMs!", ephemeral=True)
+    await ix.followup.send("Oversight request filed.", ephemeral=True)
 
 @bot.tree.command(name="respond", description="Send a response to a request", guild=CLAIM_GUILD)
 @oversighter_only()
@@ -630,7 +629,7 @@ async def pending_cmd(ix: discord.Interaction):
 # Reminder loop
 async def reminder_loop(bot: commands.Bot):
     while not bot.is_closed():
-        cutoff = int(datetime.utcnow().timestamp()) - REMINDER_MINUTES * 60
+        cutoff = int(datetime.now(timezone.utc).timestamp()) - REMINDER_MINUTES * 60
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT id, author_id, text FROM requests "
