@@ -66,10 +66,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("oversight-modmail")
 
+# ─────────────── ticket lifecycle labels ────────────────
+# NB: “pending” keeps a placeholder; the actor/target names are
+#     appended dynamically in update_status().
 STATUSES = {
     "open":              "🟢 Open",
+    "pending":           "🕒 Pending response",
     "resolved":          "✅ Resolved",
-    "resolved_followup": "✅ Resolved (follow-up sent)",
+    "resolved_followup": "✅ Resolved (follow‑up sent)",
 }
 
 # Database schema and helpers
@@ -84,6 +88,7 @@ CREATE TABLE IF NOT EXISTS requests (
     message_id      INTEGER,
     resolved_by     INTEGER,
     resolved_at     INTEGER,
+    last_oversighter_id INTEGER,           -- who last replied
     reminded_at     INTEGER
 );
 CREATE TABLE IF NOT EXISTS oversighters      (user_id INTEGER PRIMARY KEY);
@@ -95,6 +100,11 @@ async def init_db() -> None:
         for stmt in CREATE_SQL.strip().split(";"):
             if stmt.strip():
                 await db.execute(stmt)
+        # Idempotent migration for older installs
+        try:
+            await db.execute("ALTER TABLE requests ADD COLUMN last_oversighter_id INTEGER")
+        except aiosqlite.OperationalError:
+            pass  # already present
         await db.commit()
 
 def ext2row(ext_id: int) -> int:
@@ -153,17 +163,28 @@ SUBMISSION_GUILD = discord.Object(SUBMISSION_GUILD_ID)
 CLAIM_GUILD      = discord.Object(CLAIM_GUILD_ID)
 
 # Message rendering and status updates
-async def render_request(ticket_id: int, author_mention: str, text: str, status: str) -> str:
+async def render_request(ticket_id: int,
+                        author_mention: str,
+                        text: str,
+                        status: str,
+                        thread_link: str | None = None) -> str:
     return (
         f"**Oversight Request**\n"
         f"- ID: #{ticket_id}\n"
         f"- Status: {status}\n"
         f"- From: {author_mention}\n"
         f"- Text:\n> {text}\n\n"
-        f"(Thread: <#{RESTRICTED_CHANNEL_ID}>)"
+        f"(Thread: {thread_link or f'<#{RESTRICTED_CHANNEL_ID}>'})"
     )
 
-async def update_status(bot: commands.Bot, row_id: int, new_status: str) -> None:
+async def update_status(
+    bot: commands.Bot,
+    row_id: int,
+    new_status: str,
+    *,
+    actor_id: int | None = None,   # oversighter performing the action
+    target_id: int | None = None,  # user waiting to reply
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT message_id, thread_id FROM requests WHERE id = ?", (row_id,))
         row = await cur.fetchone()
@@ -176,7 +197,13 @@ async def update_status(bot: commands.Bot, row_id: int, new_status: str) -> None
         try:
             main_msg = await chan.fetch_message(main_msg_id)
             parts = main_msg.content.split("\n")
-            parts[1] = f"- Status: {STATUSES[new_status]}"
+            if new_status == "resolved":
+                parts[1] = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
+            elif new_status == "pending":
+                parts[1] = (f"- Status: {STATUSES[new_status]} "
+                            f"from <@{actor_id}> → <@{target_id}>")
+            else:
+                parts[1] = f"- Status: {STATUSES[new_status]}"
             await main_msg.edit(content="\n".join(parts))
             if new_status == "resolved":
                 await main_msg.unpin()
@@ -186,7 +213,13 @@ async def update_status(bot: commands.Bot, row_id: int, new_status: str) -> None
         try:
             first = await thread.fetch_message(thread.last_message_id)
             parts = first.content.split("\n")
-            parts[1] = f"- Status: {STATUSES[new_status]}"
+            if new_status == "resolved":
+                parts[1] = f"- Status: {STATUSES[new_status]} by <@{actor_id}>"
+            elif new_status == "pending":
+                parts[1] = (f"- Status: {STATUSES[new_status]} "
+                            f"from <@{actor_id}> → <@{target_id}>")
+            else:
+                parts[1] = f"- Status: {STATUSES[new_status]}"
             await first.edit(content="\n".join(parts))
         except discord.NotFound:
             pass
@@ -291,18 +324,22 @@ async def resolve_request(inter: discord.Interaction, ticket_id: int):
         )
         await db.commit()
 
-    await update_status(bot, row_id, "resolved")
+    await update_status(bot, row_id, "resolved", actor_id=inter.user.id)
 
     # Notify requester
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT author_id FROM requests WHERE id=?", (row_id,))
-        (uid,) = await cur.fetchone()
+        cur = await db.execute("SELECT author_id, thread_id FROM requests WHERE id=?", (row_id,))
+        (uid, thread_id) = await cur.fetchone()
     user = await bot.fetch_user(uid)
     await user.send(
         f"Your Oversight request **#{ticket_id}** has been **resolved**.",
         view=FollowUpButtonView(ticket_id),
     )
 
+    # Post a note inside the thread for context
+    thread = bot.get_channel(thread_id) if (thread_id := thread_id) else None
+    if thread:
+        await thread.send(f"✅ Resolved by {inter.user.mention}")
     await inter.response.send_message("✅ Resolved.", ephemeral=True)
 
 async def send_oversight_response(inter: discord.Interaction, ticket_id: int, text: str):
@@ -328,7 +365,19 @@ async def send_oversight_response(inter: discord.Interaction, ticket_id: int, te
     if thread:
         await thread.send(f"**Oversight response by {inter.user.mention}:**\n> {text}")
 
-    # If the request was 'resolved_followup', mark back to plain 'resolved'
+    # Mark ticket ↦ «pending reply» and remember who last answered
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE requests SET status='pending', last_oversighter_id=? WHERE id=?",
+            (inter.user.id, row_id),
+        )
+        await db.commit()
+    await update_status(
+        bot, row_id, "pending",
+        actor_id=inter.user.id, target_id=author_id
+    )
+
+    # If it *used to be* “follow‑up resolved”, drop the extra flag
     if status == "resolved_followup":
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -343,20 +392,30 @@ async def post_followup_from_user(inter: discord.Interaction, ticket_id: int, bo
     row_id = ext2row(ticket_id)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT thread_id, status FROM requests WHERE id=?", (row_id,)
+            "SELECT thread_id, status, last_oversighter_id FROM requests WHERE id=?", (row_id,)
         )
         row = await cur.fetchone()
     if not row:
         await inter.response.send_message("Sorry, I couldn't find that request.", ephemeral=True); return
-    thread_id, status = row
+    thread_id, status, last_ov = row
     thread = bot.get_channel(thread_id)
     if not thread:
         await inter.response.send_message("Thread no longer exists.", ephemeral=True); return
 
-    await thread.send(f"**Follow-up from <@{inter.user.id}>:**\n> {body}")
+    ping = f"<@{last_ov}> " if last_ov else ""
+    await thread.send(f"{ping}**Follow‑up from <@{inter.user.id}>:**\n> {body}")
 
-    # If already resolved, flip to resolved_followup
-    if status == "resolved":
+    # Transition matrix
+    if status == "pending":
+        # awaiting oversighter – reopen
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE requests SET status='open', last_oversighter_id=NULL WHERE id=?",
+                (row_id,),
+            )
+            await db.commit()
+        await update_status(bot, row_id, "open")
+    elif status == "resolved":
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE requests SET status='resolved_followup' WHERE id=?", (row_id,)
@@ -402,15 +461,22 @@ async def oversight_cmd(ix: discord.Interaction, request_text: str):
 
     ticket_id = await create_request_record(ix.user.id, request_text)
 
-    # Build first message
-    content = await render_request(ticket_id, ix.user.mention, request_text, STATUSES["open"])
+    # First draft (thread doesn’t exist yet)
+    content = await render_request(
+        ticket_id, ix.user.mention, request_text, STATUSES["open"]
+    )
     chan = bot.get_channel(RESTRICTED_CHANNEL_ID)
     main_msg = await chan.send(content, view=RequestView(ticket_id))
     await main_msg.pin()
     # Create a (public) thread – no `type=` kw‑arg needed
-    thread = await main_msg.create_thread(
-        name=f"Request #{ticket_id}",
+    thread = await main_msg.create_thread(name=f"Request #{ticket_id}")
+    thread_link = f"<#{thread.id}>"
+
+    # Re‑render with a correct link **after** the thread exists
+    content = await render_request(
+        ticket_id, ix.user.mention, request_text, STATUSES["open"], thread_link
     )
+    await main_msg.edit(content=content)
     thread_msg = await thread.send(content, view=RequestView(ticket_id))
 
     # Save locations
